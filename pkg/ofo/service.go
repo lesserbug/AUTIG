@@ -1,0 +1,504 @@
+package ofo
+
+import (
+	"SpeedFair_simplify/pkg/network"
+	"SpeedFair_simplify/pkg/types"
+	"context"
+	"fmt"
+	"log"
+	"math"
+	"sync"
+	"time"
+)
+
+const (
+	localOrderChanSize = 512
+	batchReadyChanSize = 256
+)
+
+type CandidateHandler func(fragment *types.VerifiableFairOrderFragment, digest [32]byte)
+
+type pendingCandidate struct {
+	digest    [32]byte
+	preState  *EvidenceState
+	postState *EvidenceState
+	manager   *DependencyManager
+	fragment  *types.VerifiableFairOrderFragment
+	done      chan struct{}
+}
+
+type OFOService struct {
+	ReplicaID   uint64
+	isLeader    bool
+	isMalicious bool
+	network     network.NetworkInterface
+	auth        types.Authenticator
+	admission   types.TransactionAdmission
+	authContext types.AuthContext
+	onCandidate CandidateHandler
+
+	rwMu                    sync.RWMutex
+	committed               *EvidenceState
+	pending                 *pendingCandidate
+	latestCommittedFragment [32]byte
+
+	// Only the leader persists the active graph materialization.
+	UtigManager *DependencyManager
+
+	receiptQueue      []types.TxID
+	observed          map[types.TxID]bool
+	localOrderPending *types.LocalOrder
+	txSubmissionTimes map[types.TxID]time.Time
+
+	pipelineCtx        context.Context
+	pipelineCancel     context.CancelFunc
+	pipelineWg         sync.WaitGroup
+	localOrderChan     chan *types.LocalOrder
+	batchReadyChan     chan []*types.LocalOrder
+	collectorRoundDone chan struct{}
+
+	replicaCount uint64
+	fFaulty      uint64
+	gamma        float64
+	loMaxSize    int
+	loInterval   *int
+
+	totalLatency             time.Duration
+	finalizedCountForLatency int64
+}
+
+func NewOFOService(replicaID, n, f uint64, gamma float64, net network.NetworkInterface, loMaxSize int, loInterval *int, isMalicious bool, auth types.Authenticator, admission types.TransactionAdmission, authContext types.AuthContext, genesis types.ProtocolGenesis, onCandidate CandidateHandler) (*OFOService, error) {
+	if n == 0 || replicaID >= n || f >= n || f > (n-1)/3 {
+		return nil, fmt.Errorf("AUTIG requires n >= 3f+1 and replica identifiers in [0,n)")
+	}
+	if math.IsNaN(gamma) || gamma <= 0.5 || gamma > 1 {
+		return nil, fmt.Errorf("AUTIG requires gamma in (1/2,1]")
+	}
+	qH := uint64(math.Ceil(gamma * float64(n-f)))
+	if 2*qH < n+2*f+1 {
+		return nil, fmt.Errorf("AUTIG parameters violate 2*ceil(gamma*(n-f)) >= n+2f+1")
+	}
+	if loMaxSize < 0 {
+		return nil, fmt.Errorf("local order size limit cannot be negative")
+	}
+	if auth == nil {
+		return nil, fmt.Errorf("AUTIG authentication capability is required")
+	}
+	if admission == nil {
+		return nil, fmt.Errorf("AUTIG transaction admission capability is required")
+	}
+	if authContext.LeaderID >= n {
+		return nil, fmt.Errorf("authorized order leader %d is not a replica", authContext.LeaderID)
+	}
+	s := &OFOService{
+		ReplicaID: replicaID, isLeader: replicaID == authContext.LeaderID, isMalicious: isMalicious,
+		network: net, auth: auth, admission: admission, authContext: authContext, onCandidate: onCandidate,
+		committed: NewEvidenceState(authContext.Epoch, n, genesis.StateID), latestCommittedFragment: genesis.FragmentDigest,
+		observed:          make(map[types.TxID]bool),
+		txSubmissionTimes: make(map[types.TxID]time.Time), replicaCount: n, fFaulty: f,
+		gamma: gamma, loMaxSize: loMaxSize, loInterval: loInterval,
+	}
+	if s.isLeader {
+		if onCandidate == nil {
+			return nil, fmt.Errorf("order leader requires a hosting candidate handler")
+		}
+		s.UtigManager = NewDependencyManager(n, f, gamma)
+		s.pipelineCtx, s.pipelineCancel = context.WithCancel(context.Background())
+		s.localOrderChan = make(chan *types.LocalOrder, localOrderChanSize)
+		s.batchReadyChan = make(chan []*types.LocalOrder, batchReadyChanSize)
+		s.collectorRoundDone = make(chan struct{})
+		s.pipelineWg.Add(2)
+		go s.runCollectorStage()
+		go s.runProposerStage()
+	}
+	return s, nil
+}
+
+func (s *OFOService) Stop() {
+	if s.isLeader {
+		s.pipelineCancel()
+		s.pipelineWg.Wait()
+	}
+}
+
+func (s *OFOService) HandleMessage(msg network.Message) {
+	switch payload := msg.Payload.(type) {
+	case *types.LocalOrder:
+		if s.isLeader && msg.From == payload.ReplicaID {
+			select {
+			case s.localOrderChan <- cloneLocalOrder(payload):
+			case <-s.pipelineCtx.Done():
+			}
+		}
+	case *types.VerifiableFairOrderFragment:
+		if !s.isLeader {
+			if !s.verifyCandidate(payload, msg.From) {
+				fmt.Printf("[Replica %d] Verification FAILED for fragment.\n", s.ReplicaID)
+			}
+		}
+	case *types.Transaction:
+		if types.TransactionID(payload.CanonicalBytes) != payload.ID {
+			return
+		}
+		if err := s.admission.ValidateAdmission(payload.CanonicalBytes); err != nil {
+			return
+		}
+		if err := s.admission.Store(*payload); err != nil {
+			return
+		}
+		s.rwMu.Lock()
+		if !s.observed[payload.ID] {
+			s.observed[payload.ID] = true
+			s.receiptQueue = append(s.receiptQueue, payload.ID)
+		}
+		if _, exists := s.txSubmissionTimes[payload.ID]; !exists {
+			s.txSubmissionTimes[payload.ID] = payload.SubmissionTime
+		}
+		s.rwMu.Unlock()
+	}
+}
+
+func cloneLocalOrder(order *types.LocalOrder) *types.LocalOrder {
+	copyOrder := *order
+	copyOrder.OrderedTxs = append([]types.TxID(nil), order.OrderedTxs...)
+	copyOrder.Signature = append([]byte(nil), order.Signature...)
+	return &copyOrder
+}
+
+func (s *OFOService) GenerateAndSendLocalOrder() {
+	s.rwMu.Lock()
+	if s.localOrderPending != nil {
+		order := cloneLocalOrder(s.localOrderPending)
+		s.rwMu.Unlock()
+		s.sendLocalOrder(order)
+		return
+	}
+	sampleSize := s.loMaxSize
+	if len(s.receiptQueue) < sampleSize {
+		sampleSize = len(s.receiptQueue)
+	}
+	ids := append([]types.TxID(nil), s.receiptQueue[:sampleSize]...)
+	if s.isMalicious {
+		for i, j := 0, len(ids)-1; i < j; i, j = i+1, j-1 {
+			ids[i], ids[j] = ids[j], ids[i]
+		}
+	}
+	order := &types.LocalOrder{
+		ReplicaID: s.ReplicaID, Epoch: s.committed.Epoch, FragmentSeq: s.committed.FragmentSeq + 1,
+		PrevPosition: s.committed.Seq[s.ReplicaID], PrevHead: s.committed.Head[s.ReplicaID], OrderedTxs: ids,
+	}
+	order.NewPosition = order.PrevPosition + uint64(len(ids))
+	order.NewHead = types.LocalOrderHead(order)
+	signature, err := s.auth.SignReplica(s.ReplicaID, types.LocalOrderDigest(order))
+	if err != nil {
+		s.rwMu.Unlock()
+		log.Printf("Replica %d could not sign LocalOrder: %v", s.ReplicaID, err)
+		return
+	}
+	order.Signature = signature
+	s.localOrderPending = cloneLocalOrder(order)
+	s.rwMu.Unlock()
+	s.sendLocalOrder(order)
+}
+
+func (s *OFOService) sendLocalOrder(order *types.LocalOrder) {
+	if !s.network.Send(network.Message{Type: "LocalOrder", From: s.ReplicaID, To: s.authContext.LeaderID, Payload: order}) {
+		log.Printf("BENCHMARK LOCAL SEND FAILURE: LocalOrder from replica %d", s.ReplicaID)
+	}
+}
+
+func (s *OFOService) runCollectorStage() {
+	defer s.pipelineWg.Done()
+	defer close(s.batchReadyChan)
+	requiredOrders := s.replicaCount - s.fFaulty
+	var pending []*types.LocalOrder
+	receivedFrom := make(map[uint64]bool)
+	timeout := 200 * time.Millisecond
+	if s.loInterval != nil {
+		timeout = 2 * time.Duration(*s.loInterval) * time.Millisecond
+	}
+	timer := time.NewTimer(timeout)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	sendBatch := func() {
+		if len(pending) == 0 {
+			return
+		}
+		batch := pending
+		pending = nil
+		receivedFrom = make(map[uint64]bool)
+		select {
+		case s.batchReadyChan <- batch:
+		case <-s.pipelineCtx.Done():
+			return
+		}
+		select {
+		case <-s.collectorRoundDone:
+		case <-s.pipelineCtx.Done():
+		}
+	}
+	for {
+		select {
+		case order := <-s.localOrderChan:
+			s.rwMu.RLock()
+			expectedFragmentSeq := s.committed.FragmentSeq + 1
+			s.rwMu.RUnlock()
+			if order.FragmentSeq != expectedFragmentSeq {
+				continue
+			}
+			if len(pending) == 0 {
+				timer.Reset(timeout)
+			}
+			if !receivedFrom[order.ReplicaID] {
+				pending = append(pending, order)
+				receivedFrom[order.ReplicaID] = true
+			}
+			if uint64(len(pending)) >= requiredOrders {
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				sendBatch()
+			}
+		case <-timer.C:
+			// Without a committed handoff protocol, timeout cannot authorize a
+			// partial evidence batch. Keep collecting the current round.
+		case <-s.pipelineCtx.Done():
+			return
+		}
+	}
+}
+
+func (s *OFOService) runProposerStage() {
+	defer s.pipelineWg.Done()
+	for {
+		select {
+		case <-s.pipelineCtx.Done():
+			return
+		case orders, ok := <-s.batchReadyChan:
+			if !ok {
+				return
+			}
+			candidate, err := s.constructCandidate(orders)
+			if err != nil {
+				log.Printf("Order leader rejected evidence batch: %v", err)
+				select {
+				case s.collectorRoundDone <- struct{}{}:
+				case <-s.pipelineCtx.Done():
+					return
+				}
+				continue
+			}
+			s.onCandidate(candidate.fragment, candidate.digest)
+			select {
+			case <-candidate.done:
+			case <-s.pipelineCtx.Done():
+				return
+			}
+			select {
+			case s.collectorRoundDone <- struct{}{}:
+			case <-s.pipelineCtx.Done():
+				return
+			}
+		}
+	}
+}
+
+func (s *OFOService) constructCandidate(orders []*types.LocalOrder) (*pendingCandidate, error) {
+	s.rwMu.Lock()
+	defer s.rwMu.Unlock()
+	if s.pending != nil {
+		return nil, fmt.Errorf("a candidate is already pending")
+	}
+	preState := s.committed.clone()
+	manager := s.UtigManager.clone()
+	fragmentSeq := s.committed.FragmentSeq + 1
+	touchedNodes, touchedPairs, err := applyEvidence(preState, orders, s.authContext.Epoch, fragmentSeq, s.replicaCount, s.fFaulty, s.gamma, s.loMaxSize, s.auth, s.admission)
+	if err != nil {
+		return nil, err
+	}
+	manager.refresh(preState, touchedNodes, touchedPairs)
+	finalOrder, certificate, err := manager.buildProposal(preState)
+	if err != nil {
+		return nil, err
+	}
+	postState := preState.clone()
+	postManager := manager.clone()
+	finalize(postState, postManager, finalOrder, certificate.Part)
+	fragment := &types.VerifiableFairOrderFragment{
+		Epoch: s.authContext.Epoch, AuthContextID: s.authContext.Identifier, LeaderID: s.authContext.LeaderID,
+		FragmentSeq: fragmentSeq, PreviousStateID: s.committed.StateID,
+		PreviousFragmentDigest: s.latestCommittedFragment, Evidence: cloneOrders(orders),
+		FinalOrder: finalOrder, Certificate: certificate,
+		CandidateEvidenceStateID: preState.StateID, CandidatePostStateID: postState.StateID,
+	}
+	digest := types.FragmentDigest(fragment)
+	signature, err := s.auth.SignLeader(s.authContext, digest)
+	if err != nil {
+		return nil, fmt.Errorf("sign fragment: %w", err)
+	}
+	fragment.LeaderSignature = signature
+	candidate := &pendingCandidate{digest: digest, preState: preState, postState: postState, manager: postManager, fragment: fragment, done: make(chan struct{})}
+	s.pending = candidate
+	return candidate, nil
+}
+
+func cloneOrders(orders []*types.LocalOrder) []*types.LocalOrder {
+	cloned := make([]*types.LocalOrder, len(orders))
+	for index, order := range orders {
+		cloned[index] = cloneLocalOrder(order)
+	}
+	return cloned
+}
+
+func (s *OFOService) verifyCandidate(fragment *types.VerifiableFairOrderFragment, sender uint64) bool {
+	s.rwMu.Lock()
+	defer s.rwMu.Unlock()
+	digest := types.FragmentDigest(fragment)
+	if sender != s.authContext.LeaderID || fragment.LeaderID != s.authContext.LeaderID || fragment.Epoch != s.authContext.Epoch || fragment.AuthContextID != s.authContext.Identifier {
+		return false
+	}
+	if fragment.FragmentSeq != s.committed.FragmentSeq+1 || fragment.PreviousStateID != s.committed.StateID || fragment.PreviousFragmentDigest != s.latestCommittedFragment {
+		return false
+	}
+	if !s.auth.VerifyLeader(s.authContext, fragment.LeaderID, digest, fragment.LeaderSignature) {
+		return false
+	}
+	if s.pending != nil {
+		return s.pending.digest == digest
+	}
+	preState := s.committed.clone()
+	if _, _, err := applyEvidence(preState, fragment.Evidence, fragment.Epoch, fragment.FragmentSeq, s.replicaCount, s.fFaulty, s.gamma, s.loMaxSize, s.auth, s.admission); err != nil {
+		return false
+	}
+	if preState.StateID != fragment.CandidateEvidenceStateID {
+		return false
+	}
+	if err := verifyStructuralCertificate(preState, fragment.FinalOrder, fragment.Certificate, s.replicaCount, s.fFaulty, s.gamma); err != nil {
+		log.Printf("Replica %d rejected structural certificate: %v", s.ReplicaID, err)
+		return false
+	}
+	postState := preState.clone()
+	finalize(postState, NewDependencyManager(s.replicaCount, s.fFaulty, s.gamma), fragment.FinalOrder, fragment.Certificate.Part)
+	if postState.StateID != fragment.CandidatePostStateID {
+		return false
+	}
+	s.pending = &pendingCandidate{digest: digest, preState: preState, postState: postState, fragment: fragment, done: make(chan struct{})}
+	return true
+}
+
+// CommitPending is the only path that installs authoritative state. The hosting
+// layer must call it with the digest of a BFT-committed proposal.
+func (s *OFOService) CommitPending(digest [32]byte) ([]types.FairnessBatch, bool) {
+	s.rwMu.Lock()
+	defer s.rwMu.Unlock()
+	if s.pending == nil || s.pending.digest != digest {
+		return nil, false
+	}
+	candidate := s.pending
+	s.committed = candidate.postState
+	s.latestCommittedFragment = digest
+	if s.isLeader {
+		s.UtigManager = candidate.manager
+	}
+	s.applyCommittedLocalOrder(candidate.fragment.Evidence)
+	finalizeTime := time.Now()
+	for _, batch := range candidate.fragment.FinalOrder.Batches {
+		for _, id := range batch.Transactions {
+			if submitted, ok := s.txSubmissionTimes[id]; ok {
+				latency := finalizeTime.Sub(submitted)
+				if latency < 0 {
+					latency = 0
+				}
+				s.totalLatency += latency
+				s.finalizedCountForLatency++
+				delete(s.txSubmissionTimes, id)
+			}
+		}
+	}
+	batches := append([]types.FairnessBatch(nil), candidate.fragment.FinalOrder.Batches...)
+	s.pending = nil
+	close(candidate.done)
+	return batches, true
+}
+
+func (s *OFOService) AbandonPending(digest [32]byte) bool {
+	s.rwMu.Lock()
+	defer s.rwMu.Unlock()
+	if s.pending == nil || s.pending.digest != digest {
+		return false
+	}
+	candidate := s.pending
+	s.pending = nil
+	close(candidate.done)
+	return true
+}
+
+func (s *OFOService) applyCommittedLocalOrder(orders []*types.LocalOrder) {
+	for _, order := range orders {
+		if order.ReplicaID != s.ReplicaID {
+			continue
+		}
+		committed := make(map[types.TxID]bool, len(order.OrderedTxs))
+		for _, id := range order.OrderedTxs {
+			committed[id] = true
+		}
+		remaining := s.receiptQueue[:0]
+		for _, id := range s.receiptQueue {
+			if !committed[id] {
+				remaining = append(remaining, id)
+			}
+		}
+		s.receiptQueue = remaining
+		if s.localOrderPending != nil && types.LocalOrderDigest(s.localOrderPending) == types.LocalOrderDigest(order) {
+			s.localOrderPending = nil
+		}
+	}
+	// An extension omitted from this committed fragment keeps its receipt queue,
+	// but must be re-signed for the next fragment sequence.
+	if s.localOrderPending != nil && s.localOrderPending.FragmentSeq <= s.committed.FragmentSeq {
+		s.localOrderPending = nil
+	}
+}
+
+func (s *OFOService) GetFinalizedCount() int {
+	s.rwMu.RLock()
+	defer s.rwMu.RUnlock()
+	return len(s.committed.Done)
+}
+
+func (s *OFOService) GetUTIGNodeCount() int {
+	if !s.isLeader {
+		return -1
+	}
+	s.rwMu.RLock()
+	defer s.rwMu.RUnlock()
+	return s.UtigManager.GetUTIGNodesCount()
+}
+
+func (s *OFOService) GetLatencyStats() (time.Duration, int64) {
+	s.rwMu.RLock()
+	defer s.rwMu.RUnlock()
+	if s.finalizedCountForLatency == 0 {
+		return 0, 0
+	}
+	return s.totalLatency / time.Duration(s.finalizedCountForLatency), s.finalizedCountForLatency
+}
+
+func (s *OFOService) CommittedStateID() [32]byte {
+	s.rwMu.RLock()
+	defer s.rwMu.RUnlock()
+	return s.committed.StateID
+}
+
+func (s *OFOService) PendingDigest() ([32]byte, bool) {
+	s.rwMu.RLock()
+	defer s.rwMu.RUnlock()
+	if s.pending == nil {
+		return [32]byte{}, false
+	}
+	return s.pending.digest, true
+}

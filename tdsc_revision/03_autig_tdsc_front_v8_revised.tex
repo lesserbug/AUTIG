@@ -1,0 +1,247 @@
+\begin{abstract}
+Byzantine fault-tolerant (BFT) consensus secures agreement on transaction logs
+but generally does not constrain the order chosen within a valid proposal,
+leaving room for transaction-order manipulation and maximal extractable value
+(MEV).  Graph-based fair-ordering protocols constrain this discretion by
+aggregating replicas' receipt observations, yet their validation often remains
+symmetric: followers reconstruct the dependency graph and repeat its
+extraction before accepting a proposal.  We present AUTIG, a modular
+fair-ordering layer that separates authoritative cumulative evidence from
+graph materialization.  Replicas maintain authenticated, prefix-consistent
+receipt-order evidence, while only the order leader materializes the resulting
+state as a persistent Unconfirmed-Transaction Incremental Graph and
+incrementally refreshes affected relations.  Each proposal carries a
+structural certificate for a deterministic safe closure.  Followers evaluate
+pair relations from local evidence to validate the selected order, its
+incoming boundary, and why excluded transactions remain pending, without
+materializing the complete active graph or repeating full-graph extraction.  We
+prove authenticated-state agreement, $\gamma$-batch-order-fairness, pruning
+and recovery safety, and conditional progress under stabilized ancestry.  In
+ordering-layer experiments on AWS EC2, AUTIG improves throughput by
+1.6$\times$--3.4$\times$ and reduces ordering latency by 28\%--40\% over a
+Themis-style baseline in the reported 30--60-replica configurations.
+\end{abstract}
+
+\IEEEpeerreviewmaketitle
+
+%-------------------------------------------------------------------------------
+\section{Introduction}
+\label{sec:introduction}
+%-------------------------------------------------------------------------------
+
+Byzantine fault-tolerant (BFT) state-machine replication allows a set of
+replicas to agree on a common, totally ordered transaction log despite
+Byzantine participants~\cite{schneider1990implementing,xu2023survey,
+zhang2024reaching,
+castro1999practical,yin2019hotstuff}.  Agreement on a valid proposal, however,
+does not generally distinguish among its admissible transaction orders.
+Because multiple orders may satisfy validity, a proposal leader retains
+discretion over the relative placement of included transactions without
+violating consensus safety.  In blockchain and financial applications, this
+discretion creates opportunities for transaction-order manipulation and
+maximal extractable value (MEV)~\cite{daian2020flash,eskandari2019sok,
+gramoli2024resilience,
+qin2022quantifying,zhou2021high,baum2022sok,heimbach2022eliminating,
+heimbach2024non}.  Order-fairness treats this discretion as an ordering-layer
+correctness concern: the committed order should reflect information reported
+by multiple replicas rather than the preference of one proposal
+leader~\cite{kelkar2020order,orda2021enforcing,kiayias2024ordering,
+cachin2022quick,kelkar2022order,zhang2020byzantine,kursawe2020wendy,
+li2024sok,chen2024auncel}.
+
+Fair-ordering approaches constrain the output using different signals,
+including causal or timing information and relative or weighted receipt
+observations~\cite{kelkar2022orderfair,kursawe2020wendy,zhang2020byzantine,
+chen2024auncel}.  Among these approaches, graph-based relative-order fairness
+provides a concrete mechanism for batch-order guarantees.  Replicas report
+signed local precedence observations; threshold-supported pair relations
+induce a directed transaction-dependency graph; and strongly connected
+components (SCCs) group Condorcet cycles that cannot all be represented by a
+strict total order.  This abstraction underlies Aequitas and Themis-style
+protocols~\cite{kelkar2020order,kelkar2023themis}: transactions in one SCC may
+share a fairness batch, while the condensation graph constrains the order
+among different batches.
+
+The graph abstraction also introduces a systems bottleneck.  In representative
+graph-based designs, validation remains largely symmetric: followers derive
+pair relations from the selected observations, materialize the relevant
+dependency graph, and repeat SCC and condensation-graph extraction before
+accepting the leader's result.  With $|A|$ active transactions, the relation
+space may contain $\Theta(|A|^2)$ pairs, and substantially the same graph work
+is repeated across replicas even when a proposal finalizes only part of the
+active set.  SpeedyFair separates fair ordering from consensus and overlaps
+their execution~\cite{mu2024separation}, but does not remove replica-wide
+extraction within the fair-ordering stage.  Improving scalability therefore
+requires more than moving ordering work off the consensus path: it requires
+breaking the symmetry of graph materialization and extraction without making
+the leader's derived graph authoritative.
+
+Making verification asymmetric is not equivalent to trusting the order
+leader.  Since fairness evidence accumulates across proposals, a Byzantine
+leader must not be able to alter historical pair support, omit an external
+predecessor, or hand off an incomplete live state.  Followers therefore need
+an authoritative cumulative-evidence state against which the leader's graph
+decisions can be checked.  This raises the central question of this work:
+\emph{can followers validate a graph-based fair order without persistently
+materializing the complete active graph or repeating its full extraction?}
+
+AUTIG answers this question by separating authenticated evidence from its
+graph representation.  All replicas retain prefix-consistent receipt-order
+evidence from which cumulative pair relations are derived deterministically.
+The order leader alone materializes this evidence as a persistent
+\emph{Unconfirmed-Transaction Incremental Graph} (UTIG) and refreshes newly
+active vertices and affected pairs as evidence arrives.  The UTIG is therefore
+a leader-side acceleration structure rather than an independent source of
+protocol truth.
+
+For each proposal, AUTIG extracts a deterministic \emph{safe closure}: the
+maximal down-closed subset of active transactions whose vertices have reached
+the protocol's \emph{Solid} visibility threshold.  The leader attaches a
+structural certificate that identifies the selected SCCs and their
+deterministic order and supplies a blocker forest for excluded Solid
+transactions.  Followers evaluate the required pair predicates from local
+evidence to verify the certified SCCs, the complete incoming boundary, and the
+blocker witnesses.  They do not persist the complete active dependency graph
+or repeat full-graph extraction.  The structural certificate has linear size
+in the finalized set and the represented blocker forest, although verification
+may still inspect quadratically many pair values in the worst case.
+
+AUTIG integrates this verification path with committed state continuity.  A
+locally accepted proposal produces only a candidate state, which becomes
+authoritative after the hosting BFT commits the fragment.  Derived graph
+caches may be pruned, while authenticated live evidence is retained.
+Checkpoints and committed replay preserve this state across recovery and
+order-leader handoff.  We prove authenticated-state agreement,
+incremental-materialization equivalence, safe-fragment validity,
+$\gamma$-batch-order-fairness, pruning safety, and exact recovery.  The
+progress result is conditional on stabilized ancestry: it does not provide
+unconditional progress when new arrivals indefinitely expand a transaction's
+live ancestor set.
+
+We implement AUTIG as an ordering-layer prototype and compare it with a
+Themis-style baseline on AWS EC2 with 10--100 replicas.  In the reported
+30--60-replica configurations, AUTIG improves throughput by
+1.6$\times$--3.4$\times$ and reduces ordering latency by 28\%--40\%.  These
+measurements characterize the ordering layer rather than an end-to-end BFT
+deployment.  Figure~\ref{fig:autig-overview} summarizes the architectural
+distinction.
+
+\begin{figure}[!t]
+\centering
+\subfloat[]{
+  \includegraphics[width=0.8\linewidth]{themis.pdf}
+  \label{fig:themis}
+}
+
+\vspace{0.4em}
+
+\subfloat[]{
+  \includegraphics[width=0.8\linewidth]{autig.pdf}
+  \label{fig:autig}
+}
+\caption{Ordering and validation architectures.  (a) A Themis-style design
+reconstructs the proposal graph and extraction state at each replica.
+(b) AUTIG replicates authenticated receipt-order evidence at all replicas but
+materializes the persistent UTIG only at the order leader.  Followers validate
+the selected order through a structural certificate and locally derived pair
+relations.}
+\label{fig:autig-overview}
+\end{figure}
+
+The contributions of this paper are as follows.
+\begin{itemize}
+  \item We introduce an authenticated cumulative-evidence representation based
+  on prefix-consistent receipt logs and unique per-replica first positions.
+  It makes pair relations independently derivable at followers while treating
+  graph structures as reconstructible, non-authoritative derivatives.
+
+  \item We design a persistent incremental UTIG and prove that refreshing
+  newly active vertices and touched pairs is equivalent to rematerializing the
+  protocol-defined graph from the authenticated state.
+
+  \item We develop a safe-closure rule and structural certificate that,
+  together with locally derived pair relations, let followers verify the
+  finalized SCCs, their deterministic order, the complete incoming frontier,
+  and blocker witnesses without maintaining the persistent graph.  We prove
+  authenticated-state agreement, safe-fragment validity,
+  $\gamma$-batch-order-fairness, pruning safety, exact recovery across handoff,
+  and conditional progress under stabilized ancestry.
+
+  \item We implement an ordering-layer prototype and evaluate it against a
+  Themis-style baseline on AWS EC2 with 10--100 replicas.  In the reported
+  30--60-replica configurations, AUTIG improves throughput by
+  1.6$\times$--3.4$\times$ and reduces ordering latency by 28\%--40\%.
+\end{itemize}
+
+%-------------------------------------------------------------------------------
+\section{Background}
+\label{sec:background}
+%-------------------------------------------------------------------------------
+
+\subsection{BFT Consensus and Transaction Ordering}
+
+A BFT state-machine replication protocol lets $n$ replicas agree on a common
+sequence of commands despite up to $f$ Byzantine replicas
+~\cite{schneider1990implementing,castro1999practical,yin2019hotstuff}.
+Agreement and finality prevent correct replicas from committing conflicting
+histories.  After synchrony and under the protocol's leader and availability
+assumptions, liveness ensures continued commitment of admissible proposals.
+These properties do not determine which valid transaction a leader selects or
+where it places that transaction within a proposal.
+
+Consequently, transaction-order manipulation need not violate BFT safety.  A
+leader can exploit information about pending transactions to change
+application-visible outcomes while proposing an otherwise valid
+block~\cite{daian2020flash,heimbach2022sok,malkhi2022maximal}.  Fair ordering adds
+constraints on this discretionary ordering step; the hosting BFT remains
+responsible for agreement, availability, and finality of the resulting
+ordering records.
+
+\subsection{Relative Order Fairness}
+\label{sec:background_order_fairness}
+
+Fair-ordering mechanisms differ in the observations used to constrain the
+output.  Timestamp-based approaches use clocks or timestamp attestations and
+must account for clock skew, network uncertainty, and adversarial timestamps
+~\cite{zhang2020byzantine,kursawe2020wendy}.  Relative-order approaches use
+only whether one transaction was received before another at each replica
+~\cite{kelkar2020order,kelkar2023themis}.  The latter avoids a shared-clock
+assumption but must aggregate potentially conflicting local orders.
+
+A strict global order cannot, in general, satisfy every threshold-supported
+pair relation.  Even when each replica reports a transitive local sequence,
+pairwise aggregation can produce a Condorcet cycle: a threshold supports
+$x\prec y$, another supports $y\prec z$, and a third supports $z\prec x$
+~\cite{gehrlein1983condorcet}.  Batch-order-fairness resolves this conflict by
+allowing cyclically related transactions to share a fairness batch.  If the
+required fraction of correct replicas receives $x$ before $y$, then $x$ must
+be assigned to the same or an earlier batch than $y$.
+Section~\ref{sec:fairness-objective} gives AUTIG's precise Themis-style
+$\gamma$-parameterization and integer feasibility condition.
+
+\subsection{Graph-Based Aggregation and Verification}
+\label{sec:background_architectures}
+
+Graph-based protocols represent transactions as vertices and
+threshold-supported pair preferences as directed edges.  SCCs identify cyclic
+preferences and become fairness batches; contracting them yields a DAG whose
+topological order constrains different batches.  Aequitas established this
+general construction but can suffer weak progress when newly arriving
+transactions continue to extend dependency chains~\cite{kelkar2020order}.
+Themis develops deferred-ordering machinery for stronger progress
+~\cite{kelkar2023themis}.  AUTIG adopts this relative-order fairness objective
+and graph semantics while changing the validation architecture; its
+safe-closure progress condition is stated separately in
+Proposition~\ref{prop:stabilized-progress}.
+
+The standard validation strategy reconstructs the graph from selected signed
+observations and repeats the leader's SCC, condensation, and extraction logic.
+This symmetry provides a direct validity check but replicates graph
+materialization and extraction across the system.  SpeedyFair separates fair
+ordering from the main BFT path and overlaps the two activities, improving
+scheduling while retaining replica-wide fair-order computation
+~\cite{mu2024separation}.  AUTIG addresses a different boundary: followers
+retain authenticated receipt evidence but not the persistent graph.  The
+order leader incrementally materializes that graph, and followers validate its
+selected safe closure through locally evaluated pair predicates and a
+structural certificate.

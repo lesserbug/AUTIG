@@ -1,0 +1,671 @@
+\begin{abstract}
+Leader-based Byzantine fault-tolerant (BFT) consensus constrains agreement on
+a transaction log but generally leaves the proposal leader substantial control
+over transaction order. Graph-based fair-ordering protocols reduce this
+discretion by aggregating replicas' receipt orders, yet followers typically
+reconstruct the dependency graph and repeat its extraction before voting. We
+present AUTIG, a modular layer that preserves Themis-style
+$\gamma$-batch-order-fairness while separating authenticated evidence
+replication from graph materialization. All replicas commit prefix-consistent
+extensions of signed receipt logs and retain authenticated first positions for
+live transactions. The order leader
+alone materializes this state as a persistent Unconfirmed-Transaction
+Incremental Graph (UTIG), updates affected pairs, and extracts the maximal
+Solid set that is down-closed in the active graph. Each proposal carries a
+structural certificate for the extracted SCCs, their deterministic
+condensation order, and the Shaded ancestors blocking excluded Solid
+transactions. Followers derive pair weights locally and verify the proposed
+subgraph and complete incoming frontier without maintaining the UTIG, SCCs, or
+condensation DAG. BFT commitment installs the candidate state, while
+authenticated checkpoints preserve complete live evidence across pruning,
+recovery, and order-leader handoff. Verification still has a quadratic
+worst-case pair-query count; AUTIG instead reduces redundant graph
+materialization and full-graph extraction while amortizing leader-side
+maintenance. In ordering-layer experiments on AWS EC2, our prototype improves
+throughput by 1.6$\times$--3.4$\times$ and reduces ordering latency by
+28\%--40\% over a Themis-style baseline in the reported 30--60 replica
+configurations.
+\end{abstract}
+
+\IEEEpeerreviewmaketitle
+
+%-------------------------------------------------------------------------------
+\section{Introduction}
+\label{sec:introduction}
+%-------------------------------------------------------------------------------
+
+Leader-based BFT protocols provide agreement and finality despite Byzantine
+replicas, but these guarantees do not constrain how a valid proposal orders
+its transactions~\cite{castro1999practical,yin2019hotstuff}. A leader can
+therefore reorder, delay, or insert transactions without violating consensus
+safety. In financial applications, this discretion enables front-running,
+sandwich attacks, and other forms of maximal extractable value
+(MEV)~\cite{daian2020flash,eskandari2019sok,heimbach2022eliminating,
+baum2022sok}. Order-fair protocols address this gap by making the committed
+order depend on receipt-order observations from multiple replicas rather than
+on one leader's choice~\cite{kelkar2020order,kelkar2023themis,
+cachin2022quick}.
+
+Graph-based protocols provide a practical foundation for relative-order
+fairness. Replicas report signed local orders; pairwise support induces a
+directed dependency graph; and strongly connected components (SCCs) group
+Condorcet cycles that cannot all be represented by a strict total order.
+Aequitas and Themis instantiate this approach for batch-order-fairness
+~\cite{kelkar2020order,kelkar2023themis}. Their verification architecture,
+however, remains largely symmetric: followers derive pair relations,
+materialize the relevant graph, and repeat SCC and condensation-graph
+extraction before accepting the leader's result. With $|A|$ active
+transactions, the relation space can contain $\Theta(|A|^2)$ pairs, and the
+same graph computation is repeated across replicas even when a proposal
+finalizes only part of the active set. Decoupled designs such as
+SpeedyFair~\cite{mu2024separation} overlap fair ordering with consensus, but
+do not remove this replicated extraction work.
+
+Making verification asymmetric is not as simple as trusting pair totals
+reported by the order leader. Fairness evidence accumulates across proposals,
+so a Byzantine leader could otherwise alter the historical part of a weight,
+omit an unfinalized predecessor, or hand off an incomplete live state. A sound
+design must make cumulative evidence independently authoritative at followers
+while allowing the derived graph and its extraction state to remain
+leader-side. This raises the central question of this work: \emph{can
+followers validate a graph-based fair order without persistently
+materializing and extracting the full live graph?}
+
+AUTIG answers this question with an authenticated, graph-free follower
+architecture. Correct replicas report contiguous extensions of append-only
+first-receipt logs. Every committed extension advances a per-replica hash
+chain and fixes one first position for each newly admitted transaction. All
+followers retain these authenticated positions while the transactions remain
+live; cumulative visibility and pair weights are derived deterministically,
+and retransmission
+cannot add a second contribution for the same replica and transaction pair.
+The order leader additionally maintains a persistent
+\emph{Unconfirmed-Transaction Incremental Graph} (UTIG), refreshing only
+vertices and pairs whose derived predicates may have changed. The UTIG is an
+acceleration structure: authenticated positions, rather than
+leader-maintained edges, define protocol truth.
+
+AUTIG finalizes a \emph{safe closure}. A transaction is eligible only when it
+is Solid and every ancestor in the complete active graph is also Solid. The
+result is the unique maximal Solid set that is down-closed, so a supported
+predecessor cannot remain outside a finalized set. The leader attaches a
+structural certificate containing the SCC partition, inward and outward SCC
+trees, deterministic condensation ranks, and a blocker forest that connects
+each excluded Solid transaction to a Shaded ancestor. Followers reconstruct
+the proposed induced subgraph from locally derived pair weights, check every
+incoming frontier pair, and validate the blocker witnesses. They therefore
+verify the exact safe closure and its fairness-batch order without storing the
+UTIG edge set, SCCs, or condensation DAG. Verification is output-sensitive in
+common cases, although its pair-query count remains quadratic when the
+finalized set approaches the active set.
+
+The authenticated evidence state also closes the lifecycle of the protocol.
+A verified proposal produces only a candidate state; the state becomes
+authoritative after the hosting BFT commits the fragment. Soft pruning may
+discard derived graph caches but not live receipt positions. Checkpoints bind
+the complete live-evidence state, and recovery replays only committed
+fragments and handoffs. These rules allow a successor order leader to
+reconstruct the same protocol-defined graph rather than approximating omitted
+external evidence. Under the stated feasibility condition, AUTIG satisfies
+the same $\gamma$-batch-order-fairness objective as Themis. Its progress result
+is deliberately narrower: a transaction is eventually finalized when its
+live ancestors remain within a fixed finite envelope and their evidence is
+eventually admitted. The resulting liveness guarantee is conditional on
+stabilized ancestry and does not cover continuous adversarial expansion.
+
+Figure~\ref{fig:autig-overview} summarizes the architectural distinction.
+AUTIG preserves the established fairness objective and changes its systems
+architecture: authenticated receipt evidence is replicated at followers,
+while persistent graph materialization and extraction are concentrated at the
+order leader.
+
+\begin{figure}[!t]
+\centering
+\subfloat[]{
+  \includegraphics[width=0.8\linewidth]{themis.pdf}
+  \label{fig:themis}
+}
+
+\vspace{0.4em}
+
+\subfloat[]{
+  \includegraphics[width=0.8\linewidth]{autig.pdf}
+  \label{fig:autig}
+}
+\caption{Ordering and verification architectures. (a) A Themis-style design
+reconstructs the proposal graph and extraction state at each replica. (b)
+AUTIG replicates authenticated receipt-order evidence at all replicas but
+materializes the persistent UTIG only at the order leader. Followers verify a
+structural certificate against local evidence, and BFT commitment installs the
+resulting candidate state.}
+\label{fig:autig-overview}
+\end{figure}
+
+The contributions of this paper are as follows.
+\begin{itemize}
+  \item We introduce an authenticated evidence representation based on
+  prefix-consistent receipt logs and unique per-replica first positions. It
+  gives followers an authoritative cumulative state while leaving dependency
+  edges and graph decompositions as reconstructible leader-side structures.
+
+  \item We design a persistent UTIG and prove that touched-pair refresh is
+  equivalent to materializing the graph from the authenticated state. A
+  deterministic safe-closure rule finalizes exactly the Solid transactions
+  whose active ancestors are all Solid.
+
+  \item We develop a structural certificate and graph-free verification
+  procedure for the safe closure, together with proofs of authenticated-state
+  agreement, $\gamma$-batch-order-fairness, pruning safety, and exact recovery
+  across order-leader handoff. The analysis characterizes both the
+  output-sensitive common case and the quadratic worst case.
+
+  \item We implement AUTIG as an ordering-layer prototype and evaluate it
+  against a Themis-style baseline on AWS EC2 with 10--100 replicas. In the
+  reported 30--60 replica configurations, AUTIG improves throughput by
+  1.6$\times$--3.4$\times$ and reduces ordering latency by 28\%--40\%.
+\end{itemize}
+
+%-------------------------------------------------------------------------------
+\section{Background}
+\label{sec:background}
+%-------------------------------------------------------------------------------
+
+\subsection{BFT Consensus and Transaction Ordering}
+
+A BFT state-machine replication protocol lets $n$ replicas agree on a common
+sequence of commands despite up to $f$ Byzantine replicas
+~\cite{schneider1990implementing,castro1999practical,yin2019hotstuff}.
+Agreement and finality prevent correct replicas from committing conflicting
+histories. After synchrony and under the protocol's leader and availability
+assumptions, liveness ensures continued commitment of admissible proposals.
+These properties do not determine which valid transaction a leader selects or
+where it places that transaction within a proposal.
+
+Consequently, transaction-order manipulation need not violate BFT safety. A
+leader can exploit information about pending transactions to insert a trade
+before a victim transaction or place transactions around it, changing the
+application outcome while proposing an otherwise valid block
+~\cite{daian2020flash,heimbach2022sok,malkhi2022maximal}. Fair ordering adds
+constraints on this discretionary ordering step; the hosting BFT remains
+responsible for agreement, availability, and finality of the resulting
+ordering records.
+
+\subsection{Relative Order Fairness}
+\label{sec:background_order_fairness}
+
+Fair-ordering mechanisms differ in the observations used to constrain the
+output. Timestamp-based approaches use clocks or timestamp attestations and
+must account for clock skew, network uncertainty, and adversarial timestamps
+~\cite{zhang2020byzantine,kursawe2020wendy}. Relative-order approaches use only
+whether one transaction was received before another at each replica
+~\cite{kelkar2020order,kelkar2023themis}. The latter avoids a shared-clock
+assumption but must aggregate potentially conflicting local orders.
+
+A strict global order cannot, in general, satisfy every threshold-supported
+pair relation. Even when each replica reports a transitive local sequence,
+pairwise aggregation can produce a Condorcet cycle: a threshold supports
+$x\prec y$, another supports $y\prec z$, and a third supports $z\prec x$
+~\cite{gehrlein1983condorcet}. Batch-order-fairness resolves this conflict by
+allowing cyclically related transactions to share a fairness batch. If the
+required fraction of correct replicas receives $x$ before $y$, then $x$ must
+be assigned to the same or an earlier batch than $y$. Section
+~\ref{sec:fairness-objective} gives AUTIG's precise Themis-style
+$\gamma$-parameterization and integer feasibility condition.
+
+\subsection{Graph-Based Aggregation and Verification}
+\label{sec:background_architectures}
+
+Graph-based protocols implement batch-order-fairness by representing
+transactions as vertices and threshold-supported pair preferences as directed
+edges. SCCs identify cyclic preferences and become fairness batches;
+contracting them yields a DAG whose topological order constrains different
+batches. Aequitas established this general construction but can suffer weak
+progress when newly arriving transactions continue to extend dependency
+chains~\cite{kelkar2020order}. Themis augments graph-based extraction with a
+deferred-ordering mechanism to obtain a stronger liveness guarantee
+~\cite{kelkar2023themis}. AUTIG adopts this relative-order fairness objective
+and graph semantics while changing the verification architecture; its
+safe-closure progress condition is stated separately in Proposition
+~\ref{prop:stabilized-progress}.
+
+The standard verification strategy reconstructs the graph from the selected
+signed observations and repeats the leader's SCC, condensation, and extraction
+logic. This symmetry provides a direct validity check but replicates graph
+materialization and extraction across the system. SpeedyFair separates fair
+ordering from the main BFT path and overlaps the two activities, improving
+scheduling while retaining replica-wide fair-order computation
+~\cite{mu2024separation}. AUTIG addresses a different boundary: followers
+retain authenticated receipt evidence but not the persistent graph. The order
+leader incrementally materializes that graph, and followers validate its
+selected safe closure through locally evaluated pair predicates and a
+structural certificate.
+
+\section{System Model and Preliminaries}
+\label{sec:model}
+%-------------------------------------------------------------------------------
+
+This section defines the system boundary, authenticated receipt-order evidence, fairness objective, and graph semantics used throughout AUTIG. 
+
+\subsection{System Architecture}
+\label{sec:system-architecture}
+
+We consider a system composed of a static set of $n$ replicas, $\mathcal R=\{r_1,\ldots,r_n\}$, which together provide a fair ordering service.  At most $f$ replicas are Byzantine.  A replica is correct if it remains uncorrupted throughout the execution, and $\mathcal R_C\subseteq\mathcal R$ denotes the set of correct replicas.  We consider static membership throughout one protocol execution. The hosting BFT operates under its standard resilience condition; we assume $n\ge3f+1$. AUTIG additionally requires Eq.~\eqref{eq:integer-feasibility} for batch-order-fairness.
+
+AUTIG is an ordering layer rather than a replacement for Byzantine consensus. One replica acts as the order leader. It collects authenticated receipt-order evidence, materializes the dependency graph, and proposes a fair-order fragment. The other replicas act as followers and validate the proposal before voting in the hosting BFT protocol. The BFT layer totally orders valid fragments, or their data-available digests, and provides agreement and finality. A locally verified proposal is therefore only a candidate. Its evidence state and output order become authoritative only after the corresponding fragment is BFT-committed.
+
+Fragments are indexed by sequence numbers $r=1,2,\ldots$. The variable $\mathsf{epoch}_r$ identifies the order-leader epoch responsible for sequence $r$ and advances after a committed handoff. A replacement leader resumes from the latest committed evidence state rather than from a proposal observed by only a subset of replicas.
+
+
+\subsection{Network and Adversarial Model}
+\label{sec:network-adversary}
+
+The network is partially synchronous ~\cite{dwork1988consensus}. Before an unknown global stabilization time (GST), messages may be delayed arbitrarily. After GST, messages between correct replicas are delivered within a bounded delay $\Delta$. The delay bound is required only for progress. We assume that the hosting BFT eventually installs a correct order leader and continues to commit valid AUTIG fragments derived from the latest committed state.
+
+The adversary is computationally bounded and may adaptively corrupt at most $f$ replicas in total. Corruptions are non-mobile, so a corrupted replica remains Byzantine. Byzantine replicas may equivocate, omit or delay messages, report arbitrary receipt orders, and collude with Byzantine clients. The adversary may also schedule message delivery subject to partial synchrony after GST and can therefore influence the first-receipt orders observed by correct replicas.
+
+Clients may submit duplicated, conflicting, or strategically timed transactions. A transaction is valid if it satisfies the deterministic admission predicate of the replicated application. The fairness guarantee applies only to valid transactions whose complete contents become available to all correct replicas.
+
+\subsection{Cryptographic and Data-Availability Assumptions}
+\label{sec:cryptographic-assumptions}
+
+Every replica has a certified signing key, and signatures are existentially unforgeable under chosen-message attack. The hash function $H$ is collision resistant, and $\Enc(\cdot)$ is a canonical encoding for every protocol object. For protocol objects $(X_1,\ldots,X_k)$, let $\Commit(X_1,\ldots,X_k;\mathsf{dom})=H(\mathsf{dom}\parallel\Enc(X_1,\ldots,X_k))$, where $\mathsf{dom}$ is a domain-separation tag.
+
+Transaction identifiers are content-bound. For canonical transaction bytes $\mathsf{tx}_u$, AUTIG defines
+$u=\Commit(\mathsf{tx}_u;\mathsf{AUTIG/transaction})$.  An application-native identifier, when present, is encoded inside $\mathsf{tx}_u$ and is therefore bound by $u$.  While $u$ remains live, replicas retain the content-addressed reference $\mathsf{TxRef}_r[u]=u$.  Storage locators are local and do not enter consensus state.
+
+AUTIG relies on the hosting BFT's external-validity and data-availability interface.  A correct replica votes for a fragment only after obtaining the complete fragment and the transaction contents referenced by newly admitted evidence, and after checking the application's validity predicate.  If the BFT orders a digest rather than the bytes themselves, its availability rule must ensure that the corresponding fragment remains retrievable.  Checkpoints apply an analogous availability rule to the complete live-evidence recovery package as specified in Section~\ref{sec:checkpoint-recovery}.
+
+\subsection{Authenticated Receipt-Order Evidence}
+\label{sec:receipt-order-evidence}
+
+The fairness premise concerns actual first-receipt order at correct replicas. For distinct valid transactions $u$ and $v$, we write $u\prec_i v$ if replica $i$ receives the complete contents of $u$ before those of $v$.  Replica
+$i$ validates received transactions and records their identifiers in an append-only observation log $O_i[1],O_i[2],\ldots$ according to their first-receipt order. A correct replica records each valid identifier only at its first local position and reports signed contiguous extensions of this log. 
+Therefore, a committed prefix reported by a correct replica and containing $v$ also contains every valid transaction that the same replica received before $v$. Section~\ref{sec:prefix-consistent-localorders} gives the extension format and admissibility checks.
+
+Let $\mathsf{Pos}_r(i,u)\in\mathbb N\cup\{\bot\}$ be the unique first position of live transaction $u$ in the authenticated prefix of replica $i$'s log represented by evidence-state version $r$.  Its cumulative visibility count is $c_r(u)=|\{i:\mathsf{Pos}_r(i,u)\ne\bot\}|$.
+For an ordered transaction pair, the cumulative precedence weight is
+\begin{equation}
+ W_r(u,v)=\bigl|\{i:\mathsf{Pos}_r(i,u)\ne\bot,\,
+ \mathsf{Pos}_r(i,v)\ne\bot,\,
+ \mathsf{Pos}_r(i,u)<\mathsf{Pos}_r(i,v)\}\bigr|.
+ \label{eq:position-weight}
+\end{equation}
+These values count distinct replica logs, not LocalOrder messages. Because a committed log has one first position per identifier, replica $i$ contributes at most once to an unordered pair and to at most one of $W_r(u,v)$ and $W_r(v,u)$.  Retransmission therefore cannot amplify evidence, and the
+per-replica positions uniquely determine every cumulative weight.
+
+Hatted symbols, such as $\widehat W_r$ and $\widehat A_r$, denote values derived from the candidate pre-finalization state of fragment $r$.  Unhatted symbols denote committed values unless the state version is fixed explicitly by context.
+
+The set $\mathsf{Live}_r$ contains admitted transactions that remain unfinalized. Finalized identifiers remain queryable through $\mathsf{Done}_r$, which records their committed fragment and fairness-batch index. A finalized identifier may still appear in a later contiguous log extension for continuity, but it is not reactivated and does not contribute new live-pair evidence.
+
+\subsection{Fairness and Protocol Objectives}
+\label{sec:fairness-objective}
+
+AUTIG combines the agreement supplied by the hosting BFT with three ordering-layer objectives.  First, \emph{evidence consistency} requires correct replicas that commit the same fragment sequence to derive the same authenticated
+receipt-order state.  Second, \emph{safe-fragment validity} requires an accepted fragment to contain only valid, data-available transactions and to finalize exactly the deterministic safe closure of the authenticated pre-finalization state.  Third, \emph{batch-order-fairness} constrains the relative fairness-batch indices assigned to transactions.  Section~\ref{sec:analysis} establishes these properties separately.
+
+Following the honest-replica parameterization of Themis~\cite{kelkar2023themis}, AUTIG sets the required support to a $\gamma$-fraction of the guaranteed correct-replica population $n-f$, where $\gamma\in(1/2,1]$, and uses $q_h=\lceil\gamma(n-f)\rceil$.
+Let the committed output be partitioned into consecutive fairness batches, and let $b$ be the partial map assigning a batch index to every finalized transaction. AUTIG satisfies $\gamma$-batch-order-fairness if, for every pair of distinct valid transactions $x$ and $y$ that are eventually received by all correct replicas and whenever $y\in\operatorname{dom}(b)$,
+\begin{equation}
+ \left|\{i\in\mathcal R_C:x\prec_i y\}\right|\ge q_h
+ \quad\Longrightarrow\quad
+ x\in\operatorname{dom}(b)\ \land\ b(x)\le b(y).
+ \label{eq:batch-order-fairness}
+\end{equation}
+Thus, finalizing $y$ under the antecedent requires $x$ to be finalized in the same or an earlier fairness batch. The property does not impose a strict order on transactions assigned to the same batch.
+
+AUTIG uses the following integer thresholds:
+\begin{equation}
+ T_{\mathrm{solid}}=n-2f,
+ \qquad
+ T_{\mathrm{non\mbox{-}blank}}=T_{\mathrm{edge}}
+   =n-q_h+1.
+ \label{eq:integer-thresholds}
+\end{equation}
+The fairness proof requires
+\begin{equation}
+ 2q_h\ge n+2f+1.
+ \label{eq:integer-feasibility}
+\end{equation}
+When $\gamma(n-f)$ is integral, Eq.~\eqref{eq:integer-thresholds} gives $T_{\mathrm{edge}}=n(1-\gamma)+\gamma f+1$, and
+Eq.~\eqref{eq:integer-feasibility} is equivalent to $n>2f(\gamma+1)/(2\gamma-1)$.
+We use Eqs.~\eqref{eq:integer-thresholds} and \eqref{eq:integer-feasibility} when $\gamma(n-f)$ is non-integral. Together with $n\ge3f+1$, Eq.~\eqref{eq:integer-feasibility} implies $T_{\mathrm{non\mbox{-}blank}}\le T_{\mathrm{solid}}$, so the three state intervals below are well defined.
+
+Define $\textsc{DetermineState}(c)$ to return $\Solid$ when
+$c\ge T_{\mathrm{solid}}$, $\Shaded$ when $T_{\mathrm{non\mbox{-}blank}}\le c<T_{\mathrm{solid}}$, and $\Blank$ otherwise. We write $S_r(u)=\textsc{DetermineState}(c_r(u))$.  The active set induced by cumulative evidence is
+$A_r=\{u\in\mathsf{Live}_r:S_r(u)\ne\Blank\}$. Because $c_r(u)$ is cumulative while $u$ remains live, its state can only progress from $\Blank$ to $\Shaded$ to $\Solid$. Extraction and verification operate on $A_r$.
+
+\subsection{Graph-Based Ordering Preliminaries}
+\label{sec:graph-preliminaries}
+
+AUTIG represents cumulative precedence evidence as a directed dependency graph. Let $u\triangleleft v$ denote a public total order over transaction identifiers, obtained by lexicographically comparing their canonical encodings.
+For distinct transactions, $\mathsf{EdgePred}_r(u\to v)$ holds if and only if $u,v\in A_r$, $W_r(u,v)\ge T_{\mathrm{edge}}$, and either $W_r(u,v)>W_r(v,u)$ or both $W_r(u,v)=W_r(v,u)$ and $u\triangleleft v$.
+The weight threshold excludes insufficiently observed relations, the comparison retains the stronger supported direction, and the public identifier order resolves an exact tie without leader discretion.  The active-set conjunct excludes Blank transactions, and every weight contribution is derived from a replica log containing both endpoints.
+
+The protocol-defined dependency graph at sequence $r$ is
+$G_r^\star=(A_r,E_r^\star)$, where $(u,v)\in E_r^\star$ if and only if $\mathsf{EdgePred}_r(u\to v)$.  For candidate state
+$\widehat\Sigma_r$, let $\widehat{\mathsf{EdgePred}}_r$ denote the same rule evaluated with $\widehat A_r$ and $\widehat W_r$, and define $\widehat G_r^\star=(\widehat A_r,\widehat E_r^\star)$ accordingly.
+The order leader may maintain an incremental materialization as
+$G_{\mathrm{utig}}$.  Authenticated positions and the deterministic edge predicate uniquely determine both graph versions; followers may evaluate individual predicates from local cumulative evidence without storing either edge set.
+
+For a directed graph $G=(V,E)$, $\mathsf{Anc}_G(u)$ contains $u$ and every vertex with a directed path to $u$.  A SCC is a maximal set of mutually reachable vertices; contracting every SCC yields the acyclic condensation graph.  A set $X\subseteq V$ is down-closed if $u\in X$ implies $\mathsf{Anc}_G(u)\subseteq X$.  Down-closure is the relevant finalization condition: if a finalized vertex had an unfinalized incoming ancestor, the committed output could place a supported predecessor too late.
+
+Each finalized SCC receives one global fairness-batch index.  Transactions in the same SCC therefore satisfy Eq.~\eqref{eq:batch-order-fairness} by sharing a batch, while the condensation order constrains different SCCs.  AUTIG uses a
+public deterministic serialization within an SCC only to supply the execution interface; this serialization does not assert a stronger intra-batch fairness property.  Section~\ref{sec:safe-extraction} defines which down-closed SCCs may be finalized, and Section~\ref{sec:proof-carrying-verification} defines how a graph-free follower verifies that choice.
+
+In addition to the correct-leader and BFT-liveness assumptions stated above, progress requires eventual dissemination of valid transactions and eventual admission of every pending position in a correct replica's observation log. Under these conditions, Proposition~\ref{prop:stabilized-progress} establishes eventual finalization for an active transaction whose candidate live ancestors remain within a fixed finite envelope and are eventually disseminated.
+
+
+
+
+
+
+
+
+
+%-------------------------------------------------------------------------------
+\section{The AUTIG Protocol}
+\label{sec:protocol}
+%-------------------------------------------------------------------------------
+
+This section specifies AUTIG as a modular, verifiable fair-ordering service. An overview of the architecture appears in Fig.~\ref{fig:autig-overview}.
+
+\paragraph{State and roles.}
+AUTIG separates authenticated evidence replication from graph materialization. Every replica applies committed, prefix-consistent receipt logs and maintains the resulting live positions.  The order leader additionally materializes the
+derived dependency graph as a persistent UTIG and incrementally updates its affected region.  Followers remain graph-free: they derive pair predicates from authenticated positions and verify a structural certificate without maintaining the UTIG edge set, SCC decomposition, or condensation DAG.
+
+\paragraph{Sequence workflow.}
+At each fragment sequence, replicas extend their signed observation logs; the order leader applies an admitted batch, refreshes the UTIG, extracts a safe down-closed set, and constructs its certificate.
+Followers replay the same evidence transition and verify the certificate against locally derived weights.  This produces a candidate post-state, which becomes authoritative only when the hosting BFT commits the fragment.
+Checkpoints preserve the complete live-evidence state needed for recovery and order-leader handoff.
+
+A transaction is finalizable only if it is Solid and its graph ancestors are Solid. A blocker forest explains each excluded Solid transaction, and a complete incoming-frontier check proves that the proposed set is down-closed.
+Thus followers verify the selected subgraph and its boundary without materializing or extracting the complete active dependency graph.
+
+%-------------------------------------------------------------------------------
+\subsection{Prefix-Consistent LocalOrders}
+\label{sec:prefix-consistent-localorders}
+%-------------------------------------------------------------------------------
+
+As defined in Section~\ref{sec:receipt-order-evidence}, replica $i$ records valid transactions in the order in which their complete contents are first received. Signed contiguous extensions of this observation log make prefix completeness enforceable during evidence replay.
+
+For sequence $r$, $L_i^r$ contains $(\mathsf{epoch}_r,r,i,\ell_i^{-},\ell_i^{+},\eta_i^{-},
+\mathsf{chunk}_i^r,\eta_i^{+})$ and a signature $\sigma_i$ over these fields. The chunk covers positions $\ell_i^{-}+1,\ldots,\ell_i^{+}$, and $\eta_i^{+}=\Commit(\eta_i^{-},\ell_i^{-},\ell_i^{+}, \mathsf{chunk}_i^r;\mathsf{AUTIG/local\mbox{-}log})$. Chunks are bounded by $lo\text{-}size$ but cannot skip positions.
+
+Let $\mathsf{Seq}_{r-1}[i]$ and $\mathsf{Head}_{r-1}[i]$ be the position and log head installed for $i$ by the preceding committed fragment. A LocalOrder is admissible only if its signature, epoch, sender, and sequence are valid, $\ell_i^{-}=\mathsf{Seq}_{r-1}[i]$, $\eta_i^{-}=\mathsf{Head}_{r-1}[i]$, its positions are contiguous, its identifiers are distinct within the extension, and no listed identifier outside $\mathsf{Done}_{r-1}$ already has a live position for $i$. A batch $\mathcal L_r$ contains exactly $n-f$ admissible extensions from distinct senders.
+
+Log validation is distinct from contribution to live evidence.  A delayed, chain-valid extension may contain identifiers in $\mathsf{Done}_{r-1}$; such entries preserve log continuity but neither reactivate transactions nor add incident pair evidence. Before assigning any other first position, a follower obtains the digest-bound contents, verifies application validity, and stores $\mathsf{TxRef}_r[u]$; missing or inconsistent contents reject the candidate.
+Correct replicas retransmit pending chunks.  After a committed handoff that preserves sequence $r$, they re-sign the unchanged next contiguous chunk under the successor epoch; the committed $\mathsf{Seq}$ and $\mathsf{Head}$ remain unchanged. A correct leader uses a public round-robin sender schedule, and insufficient input initiates order-leader handoff. Under Section~\ref{sec:graph-preliminaries}'s progress assumptions, every finite correct-replica log position is eventually admitted. The complete admissibility and retransmission rules appear in Appendix~\ref{app:expanded-protocol}.
+
+%-------------------------------------------------------------------------------
+\subsection{Authenticated Graph-Free Follower State}
+\label{sec:authenticated-evidence-state}
+%-------------------------------------------------------------------------------
+
+A follower persists the authoritative positions $\mathsf{Pos}_r$, sequence number $\mathsf{Seq}_r[i]$, and hash-chain head $\mathsf{Head}_r[i]$ for every replica log.  Visibility, pair weights, transaction states, and the active set
+are deterministic functions of these positions, as defined in
+Sections~\ref{sec:receipt-order-evidence} and~\ref{sec:fairness-objective}.
+
+The replicated state machine also maintains a queryable finalized-identifier dictionary $\mathsf{Done}_r$, which maps each identifier to its committed sequence and fairness-batch index, with authenticated root $\mathsf{DoneRoot}_r=\Commit(\mathsf{Done}_r; \mathsf{AUTIG/finalized\mbox{-}set})$. Checkpoints use a canonical $\mathsf{DoneRef}_r$: either an inline encoding of $\mathsf{Done}_r$ or an application-checkpoint identifier paired with $\mathsf{DoneRoot}_r$. Recovery resolves either form to a queryable dictionary and verifies its root.
+
+The follower state installed after committed fragment $r$ is
+\begin{equation}
+ \Sigma_r=\langle r,\mathsf{epoch}_r,\beta_r,\mathsf{Seq}_r,
+ \mathsf{Head}_r,\mathsf{Live}_r,\mathsf{TxRef}_r,\mathsf{Pos}_r,
+ \mathsf{Done}_r,\mathsf{DoneRoot}_r,h_r\rangle.
+ \label{eq:follower-state}
+\end{equation}
+$\beta_r$ is the largest fairness-batch index assigned through fragment $r$ (with $\beta_0=0$).  The state field $\mathsf{epoch}_r$ records the context that authorized fragment $r$; after a handoff, the current $\mathsf{AuthCtx}$ may
+advance before the next evidence state is committed.  The logical view $\mathsf{View}_r=\langle c_r,W_r,S_r,A_r\rangle
+=\mathsf{Derive}(\Sigma_r)$ is uniquely determined by $\mathsf{Pos}_r$. Implementations may cache this view, but it is non-authoritative. $\mathsf{TxRef}_r$ binds each live identifier to its available contents. Followers do not maintain the UTIG edge set, SCCs, condensation DAG, or topological order.
+
+The transition identifiers are $\widehat h_r=\Commit(\mathsf{epoch}_r,r,h_{r-1},H(\Enc(\mathcal L_r));
+\mathsf{AUTIG/prestate})$ and $h_r=\Commit(\mathsf{epoch}_r,r,\widehat h_r,F_r,\mathsf{Part}_r; \mathsf{AUTIG/poststate})$.  The $h$ field of $\widehat\Sigma_r$ is $\widehat h_r$; the field of $\Sigma_r^{\mathsf{cand}}$ and committed $\Sigma_r$ is $h_r$.  Checkpoint digests separately bind materialized recovery state. The hosting BFT supplies the committed-fragment digest $D_r=H_{\mathcal F_r}$ (with a protocol-defined genesis value $D_0$) together with the current $\mathsf{AuthCtx}$; neither context object is a field of $\Sigma_r$.
+
+%-------------------------------------------------------------------------------
+\subsection{Deterministic Evidence Transition and UTIG Refresh}
+\label{sec:evidence-transition}
+%-------------------------------------------------------------------------------
+
+Proposal verification and commitment follow the state transition:
+\begin{equation}
+ \Sigma_{r-1}\xrightarrow{\;\mathcal L_r\;}
+ \widehat\Sigma_r
+ \xrightarrow{\;(F_r,\mathsf{Part}_r)\;}
+ \Sigma_r^{\mathsf{cand}}
+ \xrightarrow{\;\textsf{BFT commit}\;}\Sigma_r.
+ \label{eq:proposal-state-transition}
+\end{equation}
+$\widehat\Sigma_r$ is the candidate pre-finalization evidence state, and $\Sigma_r^{\mathsf{cand}}$ is the candidate post-finalization state. Both are speculative; only $\Sigma_r^{\mathsf{cand}}$ is installed as $\Sigma_r$ after the hosting BFT commits the fragment.
+
+\textsc{ApplyEvidence} validates the $n-f$ extensions, installs each new non-finalized first position exactly once, and derives the affected visibility counts, pair weights, states, and active vertices.  It sets the candidate version, epoch, and $h$ fields to $r$, $\mathsf{epoch}_r$, and $\widehat h_r$, respectively. Its normative per-position procedure appears in Appendix~\ref{app:expanded-protocol}.
+
+\begin{algorithm}[h!]
+\caption{\textsc{BuildFragment}: Leader-Side Construction}
+\label{alg:build-fragment}
+\footnotesize
+\Input{$\Sigma_{r-1}$, $\mathsf{View}_{r-1}$,
+       $G_{\mathrm{utig},r-1}$, committed predecessor digest $D_{r-1}$, $\mathsf{AuthCtx}=\langle\mathsf{epoch}_r,\leaderpk\rangle$, $r$, and $\mathcal L_r$}
+\Output{$\mathcal F_r$, $\Sigma_r^{\mathsf{cand}}$, and
+        $\widehat G_{\mathrm{utig},r}$, or reject}
+$(\widehat\Sigma_r,\widehat{\mathsf{View}}_r,
+  \mathsf{TouchedNodes}_r,\mathsf{TouchedPairs}_r)
+  \gets\textsc{ApplyEvidence}(\Sigma_{r-1},\mathsf{View}_{r-1}, (\mathsf{epoch}_r,r),\mathcal L_r)$; reject on failure\;
+$\widehat G_{\mathrm{utig},r}\gets G_{\mathrm{utig},r-1}$\;
+Add every newly active vertex to $\widehat G_{\mathrm{utig},r}$ and
+re-evaluate all active pairs in $\mathsf{TouchedPairs}_r$\;
+Compute the safe SCCs, their deterministic ranks, the partition $\mathsf{Part}_r$, and certificate $\mathcal P_r$\;
+$F_r\gets$ the concatenation of the safe SCCs in rank order, with identifiers sorted within each SCC\;
+$\Sigma_r^{\mathsf{cand}}\gets
+  \textsc{Finalize}(\widehat\Sigma_r,F_r,\mathsf{Part}_r)$\;
+Construct and sign $\mathcal F_r$ with $H_{\mathcal F,\prev}=D_{r-1}$ as specified in Section~\ref{sec:proof-carrying-verification}; \KwRet
+$(\mathcal F_r,\Sigma_r^{\mathsf{cand}},\widehat G_{\mathrm{utig},r})$\;
+\end{algorithm}
+
+Pairs are touched whenever a new unique position changes either directional weight and whenever a vertex becomes active; the latter step also inserts that vertex into the candidate UTIG.  Re-evaluation therefore captures threshold, dominance, and tie changes and yields
+$\widehat G_{\mathrm{utig},r}=\widehat G_r^\star$, where
+$\widehat G_r^\star=(\widehat A_r,\widehat E_r^\star)$ is defined by the candidate evidence state.  Appendix~\ref{app:incremental-materialization} proves this equivalence.
+
+\textsc{Finalize} assigns the certified SCC batch indices, advances $\beta_r$, moves $F_r$ from $\mathsf{Live}$ to $\mathsf{Done}$, recomputes $\mathsf{DoneRoot}_r$, and removes finalized positions and $\mathsf{TxRef}$ entries while preserving all remaining live positions.  It computes $h_r$ from the transition definition rather than copying the header value. Removing $\mathsf{TxRef}[u]$ affects only AUTIG's live-evidence state; the hosting BFT or application retains committed contents until execution and its applicable checkpoint policy. Later log occurrences of finalized identifiers are continuity-only.
+
+%-------------------------------------------------------------------------------
+\subsection{Safe Finalization and Fairness Batches}
+\label{sec:safe-extraction}
+%-------------------------------------------------------------------------------
+
+The leader runs extraction on $\widehat G_{\mathrm{utig},r}$, which equals the protocol-defined $\widehat G_r^\star$.  In this subsection, $\mathsf{Solid}_r=\{u\in\widehat A_r:\widehat S_r(u)=\Solid\}$ abbreviates the candidate pre-finalization Solid set.
+For $u\in\widehat A_r$, $\mathsf{Anc}_r(u)$ contains $u$ and every vertex that reaches $u$ in $\widehat G_r^\star$.  AUTIG finalizes the set
+\begin{equation}
+ K_r^{\mathsf{safe}}
+   =\{u\in\mathsf{Solid}_r:
+          \mathsf{Anc}_r(u)\subseteq\mathsf{Solid}_r\}.
+ \label{eq:safe-closure}
+\end{equation}
+This is the unique maximal subset of Solid transactions that is down-closed in the complete active dependency graph. Equivalently, after condensing $\widehat G_r^\star$, an SCC is safe if every transaction in that SCC and every transaction in each ancestor SCC is Solid.  Safety can be computed in one topological pass: a component is unsafe if it contains a non-Solid vertex or
+has an unsafe predecessor. A Solid transaction with a Shaded ancestor remains live until that ancestor becomes Solid.
+
+The SCC boundaries define the fairness batches. Let $\beta_{r-1}$ be the largest index assigned by earlier committed fragments.  If $C_1,\ldots,C_k$ are the SCCs of
+$\widehat G_r^\star[K_r^{\mathsf{safe}}]$ in topological order, each $u\in C_j$ receives $b(u)=\beta_{r-1}+j$, and
+$\beta_r=\beta_{r-1}+k$. An empty safe set leaves $\beta_r=\beta_{r-1}$.  The fragment therefore carries
+a sequence of fairness batches, rather than treating the entire fragment as one batch.  For execution, AUTIG serializes the transactions within $C_j$ by increasing transaction identifier; this serialization is deterministic but does not change their common fairness-batch index. Across SCCs, Kahn's algorithm repeatedly selects the zero-indegree component with the smallest
+$\mathsf{cid}(C)=\min_{\triangleleft} C$.  Kahn ordering fixes the inter-SCC batch sequence, while identifier order
+fixes the intra-SCC execution serialization.
+
+The structural certificate is $\mathcal P_r=\langle\mathsf{Part}_r,\mathsf{InTree}_r, \mathsf{OutTree}_r,\mathsf{Rank}_r,\mathsf{BlockForest}_r\rangle$. $\mathsf{Part}_r$ partitions $\mathrm{set}(F_r)$ into claimed SCCs. Two trees rooted at each component's smallest identifier certify strong connectivity, and $\mathsf{Rank}_r$ records the deterministic condensation order. $\mathsf{BlockForest}_r$ is a predecessor map rooted at Shaded vertices. For each non-root $v$, its stored parent $p(v)$ satisfies $\widehat{\mathsf{EdgePred}}_r(p(v)\to v)$. Following parent pointers from every excluded Solid transaction reaches a Shaded root; equivalently, the
+candidate graph contains a path from that root to the transaction. Shared paths keep the forest linear in its represented vertices. Followers derive all required pair weights from $\widehat{\mathsf{View}}_r$, so $\mathcal P_r$ carries no weight totals. The witness forest need not be unique; the fragment digest binds the leader's selected valid witness. The leader computes the safe SCCs in one topological pass, applies the public Kahn and identifier tie-breakers, and constructs the SCC trees and blocker forest. Expanded Algorithm~\ref{alg:safe-extract} is the normative procedure. Appendix~\ref{app:running-example} illustrates evidence derivation, safe closure, structural certification, and follower verification in one example.
+
+%-------------------------------------------------------------------------------
+\subsection{Proof-Carrying Fragment Verification}
+\label{sec:proof-carrying-verification}
+%-------------------------------------------------------------------------------
+
+The leader forms $\hdr_r=\langle\mathsf{epoch}_r,r,\leaderpk,H_{\mathcal F,\prev}, h_{r-1},\widehat h_r,h_r,H_{\mathcal F_r}\rangle$ and $\mathcal F_r=\langle\hdr_r,F_r,\mathcal L_r,\mathcal P_r, \sigma_r^{\mathsf L}\rangle$, where
+\begin{equation}
+ H_{\mathcal F_r}=\Commit(\mathsf{epoch}_r,r,\leaderpk,
+ H_{\mathcal F,\prev},h_{r-1},\widehat h_r,h_r,
+ F_r,\mathcal L_r,\mathcal P_r;\domfrag).
+ \label{eq:fragment}
+\end{equation}
+The order leader signs this digest as $\sigma_r^{\mathsf L} =\mathsf{Sign}_{\mathsf{sk}_{\mathsf L}}(H_{\mathcal F_r})$ for the authorized $\leaderpk$. The digest binds the transition identifiers, evidence batch, order, certificate, and predecessor fragment. The BFT layer commits the full fragment or its data-available digest.
+
+\begin{algorithm}[h!]
+\caption{\textsc{VerifyFragment}: Verify a Proof-Carrying Fragment}
+\label{alg:verify-fragment}
+\footnotesize
+\Input{Committed state $\Sigma_{r-1}$; committed predecessor digest
+       $D_{r-1}$; current $\mathsf{AuthCtx}$; candidate fragment $\mathcal F_r$}
+\Output{$(accept,\Sigma_r^{\mathsf{cand}},h_r)$ or reject}
+Require the header's $(\mathsf{epoch}_r,\leaderpk)$ to equal $\mathsf{AuthCtx}$, require $r=\Sigma_{r-1}.r+1$, and verify $\sigma_r^{\mathsf L}$ and Eq.~\eqref{eq:fragment}; require $h_{r-1}=\Sigma_{r-1}.h$ and $H_{\mathcal F,\prev}=D_{r-1}$\;
+Derive $(\widehat\Sigma_r,\widehat{\mathsf{View}}_r)$ by
+\textsc{ApplyEvidence}; reject on failure or a mismatching $\widehat h_r$\;
+Require $F_r$ to contain distinct identifiers with
+$\mathrm{set}(F_r)\subseteq\mathsf{Solid}_r$; using local $\widehat W_r$,
+verify that $\mathsf{Part}_r$ is exactly the SCC partition of $\widehat G_r^\star[\mathrm{set}(F_r)]$ and verify its trees, deterministic condensation ranks, batch order, and serialization\;
+Require $\neg\widehat{\mathsf{EdgePred}}_r(x\to y)$ for every $(x,y)\in(\widehat A_r\setminus\mathrm{set}(F_r))
+\times\mathrm{set}(F_r)$\;
+Verify the blocker forest and require the parent pointers of every excluded Solid transaction to reach a Shaded root\; $\Sigma_r^{\mathsf{cand}}\gets
+  \textsc{Finalize}(\widehat\Sigma_r,F_r,\mathsf{Part}_r)$\;
+Verify its $h$ field equals the header's $h_r$\;
+\KwRet $(accept,\Sigma_r^{\mathsf{cand}},h_r)$
+\end{algorithm}
+
+The tree and rank checks certify the SCC partition; the frontier scan proves down-closure; and the blocker forest gives every excluded Solid transaction a Shaded ancestor.  Together these checks establish $\mathrm{set}(F_r)=K_r^{\mathsf{safe}}$, including the empty-set case, and the deterministic rank and serialization rules fix its fairness batches. The normative field-level checks appear in Algorithm~\ref{alg:verify-fragment-expanded}; Appendix~\ref{app:autig-security-details} proves their soundness.
+
+Verification does not mutate $\Sigma_{r-1}$. Once the hosting BFT commits $H_{\mathcal F_r}$, its context advances to $D_r=H_{\mathcal F_r}$; a follower
+installs $\Sigma_r^{\mathsf{cand}}$ and releases $F_r$ for execution. The order leader likewise installs $\widehat G_{\mathrm{utig},r}$ with $F_r$ and its incident edges removed as $G_{\mathrm{utig},r}$ only after that commit.
+
+%-------------------------------------------------------------------------------
+\subsection{Checkpoint and Recovery}
+\label{sec:checkpoint-recovery}
+%-------------------------------------------------------------------------------
+
+Every $K_{\mathrm{cp}}$ committed fragments, replicas encode $\mathsf{Snap}_r=\Enc(\mathsf{epoch}_r,r,\beta_r,\mathsf{Seq}_r,
+\mathsf{Head}_r,\mathsf{Live}_r,\mathsf{TxRef}_r,\mathsf{Pos}_r,
+\mathsf{DoneRef}_r,h_r)$ and set
+$d_r=\Commit(\mathsf{Snap}_r;\mathsf{AUTIG/checkpoint\mbox{-}snapshot})$. They commit
+\begin{equation}
+ \mathsf{CP}_r=\langle\mathsf{AuthCtx}_r,r,h_r,D_r,d_r,
+                       \mathsf{AvailQC}_r\rangle,
+ \label{eq:checkpoint}
+\end{equation}
+Here $\mathsf{AuthCtx}_r$ is the authorization context current when the checkpoint is committed; after a handoff, it need not equal the epoch recorded in $\Sigma_r$.  Moreover, $D_r=H_{\mathcal F_r}$ and $\mathsf{AvailQC}_r$ contains $n-f$ signatures on $(\mathsf{AuthCtx}_r,r,h_r,D_r,d_r)$.  A correct replica signs only its local committed snapshot and retains it together with all data referenced by $\mathsf{DoneRef}_r$ and $\mathsf{TxRef}_r$ until a successor checkpoint is
+committed and available.  The certificate has at least $n-2f$ correct holders, and the BFT availability layer retains the complete committed AUTIG suffix and its referenced transaction contents after the checkpoint.
+
+A recovering replica validates a digest-matching snapshot, resolves $\mathsf{DoneRef}_r$ and its authenticated root, validates all live-data references, derives $\mathsf{View}_r$ from $\mathsf{Pos}_r$, and replays only BFT-committed AUTIG suffix records.  Handoff records update $\mathsf{AuthCtx}$; fragments advance the evidence state and predecessor digest from $D_r$.  The snapshot preserves all live--live positions, including pairs outside the last finalized prefix; recovery is
+therefore exact.  A replacement leader materializes the UTIG from this state. Algorithm~\ref{alg:recover-state} and Appendix~\ref{app:checkpoint-handoff} give the complete procedure and supporting details.
+
+%-------------------------------------------------------------------------------
+\subsection{Pruning}
+\label{sec:protocol-pruning}
+%-------------------------------------------------------------------------------
+
+Soft pruning may evict derived weights, edges, adjacency indexes, and SCC/condensation metadata, provided that all authoritative live positions are retained and every required live--live value can be reconstructed. Hard
+deletion applies only to evidence incident to a transaction after that transaction appears in a BFT-committed $F_r$; $\mathsf{Done}_r$ prevents its
+reactivation.  Evidence between two unfinalized transactions is never hard-deleted.  Theorems~\ref{thm:pruning_safety} and~\ref{thm:hard-deletion}, with Appendix~\ref{app:pruning-retention}, establish that both operations preserve future extraction and verification.
+
+%-------------------------------------------------------------------------------
+\subsection{Order-Leader Handoff}
+\label{sec:order-leader-handoff}
+%-------------------------------------------------------------------------------
+
+Objective invalidity and silence use different evidence.  A fragment whose bytes, LocalOrders, certificate, and referenced contents are available and that bears a valid signature from the leader authorized by the current
+$\mathsf{AuthCtx}$ but fails any deterministic verification check against $(\Sigma_{r-1},D_{r-1})$ is independently verifiable $\mathsf{OrderFault}$ evidence and may be submitted to the hosting BFT for a replacement decision.
+A fragment signed under a superseded authorization context is merely inadmissible. Fragment or transaction-content non-delivery is not publicly verifiable and follows the timeout path. After a local timeout, $n-f$ matching signatures on $\mathsf{OrderTimeout}(\mathsf{AuthCtx},r,h_{r-1},D_{r-1})$ form a handoff
+certificate. A BFT-committed handoff record names the successor $\mathsf{AuthCtx}'=\langle\mathsf{epoch}+1,\leaderpk'\rangle$, with $\leaderpk'$ selected by the hosting BFT's deterministic replacement rule, and atomically replaces the current authorization context; it changes neither $(\Sigma_{r-1},h_{r-1},D_{r-1})$ nor sequence $r$. A late
+fragment authorized by the replaced context is inadmissible. The successor resumes from the latest committed context, never from an uncommitted candidate.
+
+
+
+%-------------------------------------------------------------------------------
+\section{Security Analysis}
+\label{sec:analysis}
+%-------------------------------------------------------------------------------
+
+We establish agreement, graph-materialization equivalence, safe-fragment validity, batch-order-fairness, retention safety, recovery, and conditional progress.  Batch-order-fairness follows because prefix-complete evidence forms
+a strict edge from every still-live required predecessor to the transaction being finalized, and safe down-closure places that predecessor in the same or an earlier batch. Complete proofs appear in the appendices.
+
+\begin{theorem}[Authenticated-state agreement]
+\label{thm:state-agreement}
+Correct replicas that commit the same fragment sequence derive identical $\Sigma_r$, $h_r$, and derived views $\mathsf{View}_r$.
+\end{theorem}
+
+\begin{theorem}[Incremental-materialization equivalence]
+\label{thm:incremental-equivalence}
+If $G_{\mathrm{utig},r-1}=G_{r-1}^\star$, then applying
+Algorithm~\ref{alg:apply-evidence}, adding every newly active vertex, and re-evaluating each pair in $\mathsf{TouchedPairs}_r$ whose endpoints lie in
+$\widehat A_r$ yields
+$\widehat G_{\mathrm{utig},r}=\widehat G_r^\star$.
+After committed finalization removes $F_r$, the installed materialization satisfies $G_{\mathrm{utig},r}=G_r^\star$.
+\end{theorem}
+
+\begin{theorem}[Safe-fragment validity]
+\label{thm:safe-fragment}
+If the normative \textsc{VerifyFragment} procedure in
+Algorithm~\ref{alg:verify-fragment-expanded} accepts $\mathcal F_r$, then $F_r$ contains only application-valid, data-available transactions and $\mathrm{set}(F_r)=K_r^{\mathsf{safe}}$.
+Moreover, $\mathsf{Part}_r$ is exactly the SCC partition of
+$\widehat G_r^\star[K_r^{\mathsf{safe}}]$, and its ranks and serialization equal the public deterministic rules.
+\end{theorem}
+
+\begin{theorem}[$\gamma$-Batch-Order-Fairness]
+\label{thm:batch-fairness}
+Assume Eq.~\eqref{eq:integer-feasibility}.
+For distinct valid transactions $x$ and $y$ eventually received by all correct replicas, if at least $q_h$ correct replicas receive $x$ before $y$, then every committed AUTIG execution that finalizes $y$ also finalizes $x$ and satisfies $b(x)\le b(y)$.
+\end{theorem}
+
+\begin{theorem}[Soft-pruning equivalence]
+\label{thm:pruning_safety}
+Let an unpruned execution and a soft-pruned execution start from the same committed state $\Sigma_{r-1}$ and apply the same admissible evidence batch $\mathcal L_r$.
+Provided that the soft-pruned execution retains every authoritative position and retains or deterministically reconstructs every required live--live pair value, both executions derive the same $\widehat G_r^\star$, $K_r^{\mathsf{safe}}$, $\mathsf{Part}_r$, serialized $F_r$, and $\Sigma_r^{\mathsf{cand}}$.
+Their structural witnesses, and hence $\mathcal P_r$, $\mathcal F_r$, and $H_{\mathcal F_r}$, may differ.
+\end{theorem}
+
+\begin{theorem}[Hard-deletion safety]
+\label{thm:hard-deletion}
+After a committed fragment finalizes $u$, AUTIG may delete $u$'s live positions and AUTIG live-data reference and evict all derived values incident to $u$.
+Relative to an execution retaining these entries, deletion changes no future live--live pair value, candidate graph, safe closure, fairness-batch assignment, or outstanding fairness obligation.
+\end{theorem}
+
+\begin{theorem}[Recovery equivalence]
+\label{thm:recovery}
+A replica that restores a digest-matching committed checkpoint and replays the subsequent BFT-committed AUTIG records derives the same evidence state, latest fragment digest, and order-leader authorization context as an uninterrupted correct replica.
+\end{theorem}
+
+\begin{proposition}[Progress under stabilized ancestry]
+\label{prop:stabilized-progress}
+Assume eventual admission of every pending position in a correct replica's log, eventual installation of a correct order leader after GST, and commitment of its valid proposals by the hosting BFT. Let $u$ be valid with $u\in A_{r_0}$ for some committed sequence $r_0$.
+Suppose that there exists a finite set $B$ such that, for every committed fragment $\mathcal F_r$ with $r>r_0$ and
+$u\in\mathsf{Live}_{r-1}$, $\mathsf{Anc}_{\widehat G_r^\star}(u)\subseteq B$. If every transaction that appears in one of these ancestor sets is eventually received by all correct replicas, then $u$ is eventually included in a committed safe closure.
+\end{proposition}
+
+Every transaction that appears as a live ancestor after $r_0$ belongs to the finite set $B$. By eventual dissemination and admission, each such transaction either
+finalizes earlier or, while it remains live, accumulates positions from at least $n-f$ correct replicas and becomes Solid. Because only finitely many such identifiers can appear, after some finite sequence every live ancestor of $u$ is Solid. Hence $u\in K_r^{\mathsf{safe}}$; a correct leader's maximal safe extraction includes $u$, and the hosting BFT eventually commits that fragment.
+Without a finite ancestor envelope, newly appearing Shaded ancestors may delay finalization indefinitely. Thus, AUTIG establishes stabilized-ancestry progress rather than
+unconditional standard liveness under continuous arrivals.
+
+%-------------------------------------------------------------------------------
+\subsection{Complexity}
+\label{sec:complexity}
+%-------------------------------------------------------------------------------
+
+Follower authoritative metadata occupies
+$O(n(|\mathsf{Live}_r|+1))$ entries for positions, per-replica log state, and live-data references, plus the selected representation of $\mathsf{Done}_r$; transaction contents are excluded. An optional aggregate-weight cache occupies $O(|\mathsf{Live}_r|^2)$ counters.
+
+Let $N_i$ and $K_i^-$ denote replica $i$'s newly admitted and previously retained live positions.
+Evidence application touches $O(\sum_i(|N_i||K_i^-|+|N_i|^2))$ unordered pairs. With cached pair weights, incremental UTIG refresh costs $O(|\mathsf{TouchedNodes}_r|+|\mathsf{TouchedPairs}_r|)$.
+The leader stores $O(|\widehat A_r|+|\widehat E_r^\star|)$ graph entries, and SCC decomposition, condensation construction, and minimum-$\mathsf{cid}$ Kahn ordering take
+$O(|\widehat A_r|+|\widehat E_r^\star|
+  +|\widehat A_r|\log|\widehat A_r|)$ time.
+
+A fragment contains $n-f$ signed LocalOrders with at most
+$(n-f)\,lo\text{-}size$ identifiers, and a structural certificate of $O(|F_r|+|V_{\mathsf{blk}}|)$ records, where
+$|V_{\mathsf{blk}}|  \le|\widehat A_r\setminus\mathrm{set}(F_r)|$. Referenced transaction bytes are workload-dependent and excluded.
+
+Structural verification performs
+$\binom{|F_r|}{2}
+ +( |\widehat A_r|-|F_r| )|F_r|
+ +O(|V_{\mathsf{blk}}|)$
+pair-value queries.
+With $O(1)$ cached-weight lookup, its cost is
+$O(|\widehat A_r||F_r|+|V_{\mathsf{blk}}|)$ and is quadratic in $|\widehat A_r|$ in the worst case; direct reconstruction from positions adds an $O(n)$ factor.
+Complete fragment verification additionally replays $\mathcal L_r$, checks $n-f+1$ signatures, and validates the availability and application validity of newly admitted transactions.
+
+\input{02_autig_tdsc_appendix_v8}

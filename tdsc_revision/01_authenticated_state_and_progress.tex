@@ -1,0 +1,364 @@
+% TDSC revision patch 01: authenticated evidence state and progress semantics.
+% Intended placement: replace the current per-round-state discussion in
+% Section III-E and move the substantive content of current Section III-F
+% into the protocol section. This is a specification draft; it does not claim
+% that the current prototype implements these mechanisms.
+
+\subsection{Authenticated Evidence State}
+\label{sec:authenticated-evidence-state}
+
+AUTIG uses cumulative ordering evidence to amortize work across fragments.
+Consequently, a verifier must authenticate not only the evidence admitted in
+the current fragment, but also the historical component that determines the
+current dependency graph. We therefore replace stateless fragment checking
+with \emph{authenticated light-state verification}. Every replica maintains
+the same deterministic evidence state derived from the sequence of committed
+fragments, while only the order leader maintains the materialized UTIG and
+runs graph extraction. This separation avoids follower-side SCC and
+topological reconstruction over the full live graph, but does not claim that
+followers are stateless.
+
+\paragraph{Admissible local orders.}
+For fragment sequence $r$, replica $i$ signs a local order
+\[
+  L_i^r = \langle r,i,\nu_i,\mathsf{txs}_i^r,\sigma_i\rangle,
+\]
+where $\nu_i$ is a monotonically increasing per-replica sequence number,
+$\mathsf{txs}_i^r$ is an ordered list of distinct, unfinalized transaction
+identifiers, and $\sigma_i$ authenticates all preceding fields. A batch
+$\mathcal L_r$ is admissible if it contains exactly $n-f$ valid local orders
+from distinct replicas, every message names sequence $r$, every $\nu_i$ is
+larger than the last admitted sequence number of replica $i$, and no listed
+transaction has already been finalized. AUTIG does not require followers to
+infer which additional messages the leader may have received; fairness and
+verification are defined over the deterministically committed admissible
+batch.
+
+\paragraph{Unique visibility and pair contributions.}
+Repeated reports must not amplify one replica's vote. For each replica $i$
+and transaction $u$, let $X_r(i,u)\in\{0,1\}$ indicate whether an admitted
+local order from $i$ has ever listed $u$ by sequence $r$. For each unordered
+live pair $\{u,v\}$, let
+\[
+ C_r(i,\{u,v\})\in\{\bot,\,u\prec v,\,v\prec u\}
+\]
+record replica $i$'s unique contribution. The first committed local order
+from $i$ that contains both transactions fixes this contribution. A later
+report of the same direction is idempotent and contributes no additional
+weight; a later report of the opposite direction is an equivocation and makes
+that local order inadmissible. The cumulative weight is therefore
+\[
+ W_r(u,v)=\sum_{i=1}^{n}
+ \mathbf 1\!left[C_r(i,\{u,v\})=u\prec v\right],
+ \qquad 0\le W_r(u,v)\le n.
+\]
+Thus, cumulative evidence represents distinct replica contributions rather
+than an unbounded count of repeated LocalOrder occurrences.
+
+\paragraph{Cumulative states and the authenticated live set.}
+Let
+\[
+ c_r(u)=\sum_{i=1}^{n}X_r(i,u)
+\]
+be the cumulative number of distinct replicas that have reported $u$.
+AUTIG applies the existing public thresholds to $c_r(u)$:
+\[
+ S_r(u)=\mathsf{DetermineState}(c_r(u))
+ \in\{\mathsf{Solid},\mathsf{Shaded},\mathsf{Blank}\}.
+\]
+Because $X_r$ is monotone, a transaction can move from Blank to Shaded to
+Solid but cannot revert while it remains unfinalized. An absent transaction
+does not have its state reset in a later fragment; absence contributes no new
+evidence. Let $\mathsf{Live}_r$ be the set of reported but unfinalized
+transactions, and define the authenticated active set
+\[
+ A_r=\{u\in\mathsf{Live}_r:S_r(u)\ne\mathsf{Blank}\}.
+\]
+The extraction graph is induced by $A_r$, and proof-frontier completeness is
+defined over $(A_r\setminus F)\times F$, rather than over the current batch
+set $B_r$. The notation $B_r$ remains reserved for transactions that are
+non-Blank with respect to the current admitted batch and is not used as the
+universe of cumulative frontier verification.
+
+Since $T_{\mathrm{edge}}=T_{\mathrm{non\mbox{-}blank}}$ and every pair
+contribution also contributes visibility for both endpoints, the following
+closure property holds:
+\[
+ \mathsf{EdgePred}_r(u\to v)\Longrightarrow u,v\in A_r.
+\]
+Hence, every cumulative dependency that can constrain finalization has both
+endpoints in the authenticated active set.
+
+\paragraph{Follower-maintained state.}
+The authoritative state after committed fragment $r$ is
+\[
+ \Sigma_r=\langle r,\mathsf{Seq}_r,\mathsf{Live}_r,
+ X_r,C_r,W_r,A_r,h_{r-1}\rangle,
+\]
+where $\mathsf{Seq}_r[i]$ is the last admitted sequence number of replica
+$i$, and $h_{r-1}$ identifies the preceding committed state. Values such as
+$W_r$, $S_r$, and $A_r$ may be stored as caches, but they are uniquely derived
+from the authenticated contribution maps. The state identifier is
+\[
+ h_r=\mathsf{Commit}(\mathsf{enc}(\Sigma_r);\mathsf{AUTIG/state}).
+\]
+Followers store $\Sigma_r$ but do not store the leader's materialized edge
+set, SCC decomposition, condensation graph, or topological order. The term
+\emph{light state} therefore refers to the separation of evidence maintenance
+from graph extraction; it does not imply subquadratic worst-case storage.
+
+\subsection{Deterministic State Transition}
+\label{sec:state-transition}
+
+Each committed fragment induces one deterministic state transition. Given
+the preceding state and the admitted local orders, replicas first compute a
+pre-finalization state,
+\[
+ \widehat\Sigma_r=\mathsf{Apply}(\Sigma_{r-1},\mathcal L_r).
+\]
+The order leader then constructs a solid-complete, down-closed fair prefix
+$F_r$ and its proof $\mathcal P_r$ from $\widehat\Sigma_r$. After the
+fragment commits, every replica removes the finalized transactions and
+obtains
+\[
+ \Sigma_r=\mathsf{Finalize}(\widehat\Sigma_r,F_r).
+\]
+Accordingly, the complete transition is
+\[
+ \Sigma_{r-1}
+ \xrightarrow{\;\mathcal L_r\;}
+ \widehat\Sigma_r
+ \xrightarrow{\;F_r\;}
+ \Sigma_r.
+\]
+
+\begin{algorithm}[t]
+\caption{Authenticated Evidence-State Transition}
+\label{alg:authenticated-state-transition}
+\begin{algorithmic}[1]
+\Require Previous committed state $\Sigma_{r-1}$; batch $\mathcal L_r$
+\Ensure Candidate pre-finalization state $\widehat\Sigma_r$;
+        touched pairs $\mathsf{Touched}_r$
+\State Verify that $\mathcal L_r$ contains exactly $n-f$ admissible
+       LocalOrders from distinct replicas
+\State $\widehat\Sigma_r\gets\Sigma_{r-1}$;
+       $\mathsf{Touched}_r\gets\emptyset$
+\For{each $L_i^r\in\mathcal L_r$}
+  \State Verify signature, fragment sequence, $\nu_i$, distinct identifiers,
+         and absence of finalized identifiers
+  \State $\widehat{\mathsf{Seq}}_r[i]\gets\nu_i$
+  \For{each transaction $u$ listed in $L_i^r$}
+    \State $\widehat X_r(i,u)\gets1$;
+           add $u$ to $\widehat{\mathsf{Live}}_r$
+  \EndFor
+  \For{each ordered pair $u\prec_i v$ induced by $L_i^r$}
+    \If{$\widehat C_r(i,\{u,v\})=\bot$}
+      \State $\widehat C_r(i,\{u,v\})\gets u\prec v$
+      \State $\widehat W_r(u,v)\gets\widehat W_r(u,v)+1$
+      \State $\mathsf{Touched}_r\gets
+             \mathsf{Touched}_r\cup\{\{u,v\}\}$
+    \ElsIf{$\widehat C_r(i,\{u,v\})=v\prec u$}
+      \State \Return reject \Comment{equivocating local order}
+    \EndIf
+  \EndFor
+\EndFor
+\For{each $u\in\widehat{\mathsf{Live}}_r$}
+  \State $\widehat S_r(u)\gets
+         \mathsf{DetermineState}(\sum_i\widehat X_r(i,u))$
+  \If{$\widehat S_r(u)\ne S_{r-1}(u)$}
+    \State Add every pair incident to $u$ to $\mathsf{Touched}_r$
+  \EndIf
+\EndFor
+\State $\widehat A_r\gets
+       \{u\in\widehat{\mathsf{Live}}_r:
+       \widehat S_r(u)\ne\mathsf{Blank}\}$
+\State \Return $(\widehat\Sigma_r,\mathsf{Touched}_r)$
+\end{algorithmic}
+\end{algorithm}
+
+The order leader re-evaluates $\mathsf{EdgePred}$ for every pair in
+$\mathsf{Touched}_r$ whose endpoints are in $\widehat A_r$. In particular, a
+pair remains touched whenever a newly admitted unique contribution changes
+either directional weight, even if both weights crossed
+$T_{\mathrm{edge}}$ in an earlier fragment. This rule covers changes caused
+by relative-weight overtaking and not only first threshold crossings.
+
+\subsection{Proof-Carrying Prefix and Authenticated Verification}
+\label{sec:authenticated-fragment-verification}
+
+The leader proposes a fragment
+\[
+ \mathcal F_r=\langle
+ r,\mathsf{leader}_{pk},h_{r-1},\widehat h_r,h_r,
+ F_r,\mathcal L_r,\mathcal P_r\rangle,
+\]
+where $\widehat h_r$ identifies the pre-finalization state and $h_r$
+identifies the post-finalization state. The proof contains state records for
+every transaction in $F_r$, weight records for every unordered internal pair
+in $F_r$, and frontier records for the complete Cartesian product
+$(\widehat A_r\setminus F_r)\times F_r$. Consequently,
+\[
+ |\mathcal P_{\mathrm{pairs}}|
+ =\frac{|F_r|(|F_r|-1)}{2}
+ +( |\widehat A_r|-|F_r| )|F_r|,
+\]
+which remains $\Theta(|\widehat A_r|^2)$ in the worst case.
+
+Unlike the original lower-bound check, a follower requires every asserted
+state and weight to equal its locally derived value in
+$\widehat\Sigma_r$. The proof therefore selects the prefix-relevant portion
+of authenticated state; it does not allow the leader to supply an unchecked
+historical component.
+
+\paragraph{Fairness and progress acceptance rule.}
+Let
+\[
+ \mathsf{Solid}_r=\{u\in\widehat A_r:
+ \widehat S_r(u)=\mathsf{Solid}\}.
+\]
+A fragment is progress-complete if (i) $F_r\subseteq\widehat A_r$;
+(ii) every active Solid transaction is included,
+$\mathsf{Solid}_r\subseteq F_r$; (iii) no edge enters $F_r$ from
+$\widehat A_r\setminus F_r$; and (iv) the order within $F_r$ is the canonical
+SCC/condensation order induced by the authenticated internal weights. An
+empty fragment is valid if and only if $\mathsf{Solid}_r=\emptyset$. Empty
+fragments are still required to carry and satisfy all integrity, batch, and
+state-transition checks; there is no early acceptance rule for
+$\mathcal P_r=\bot$.
+
+\begin{algorithm}[t]
+\caption{Generate an Authenticated Prefix Proof}
+\label{alg:generate-authenticated-proof}
+\begin{algorithmic}[1]
+\Require Pre-finalization state $\widehat\Sigma_r$ and materialized UTIG
+\Ensure Prefix $F_r$ and proof $\mathcal P_r$
+\State Construct the extraction graph induced by $\widehat A_r$
+\State Compute SCCs, the condensation graph, and the canonical solid-anchored
+       fair prefix $F_r$
+\State Ensure $\mathsf{Solid}_r\subseteq F_r$ and that $F_r$ is down-closed
+\State $\mathcal P_r.\mathsf{states}\gets
+       \{(u,\widehat S_r(u)):u\in F_r\}$
+\State $\mathcal P_r.\mathsf{infix}\gets
+       \{(\{u,v\},\widehat W_r(u,v),\widehat W_r(v,u)):
+          u,v\in F_r,u<v\}$
+\State $\mathcal P_r.\mathsf{frontier}\gets
+       \{(x,y,\widehat W_r(x,y),\widehat W_r(y,x)):
+          (x,y)\in(\widehat A_r\setminus F_r)\times F_r\}$
+\State $\Sigma_r\gets\mathsf{Finalize}(\widehat\Sigma_r,F_r)$
+\State Bind $h_{r-1}$, $\widehat h_r$, $h_r$, $F_r$, $\mathcal L_r$, and
+       $\mathcal P_r$ in the fragment digest
+\State \Return $(F_r,\mathcal P_r)$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[t]
+\caption{Authenticated Fragment-Local Verification}
+\label{alg:authenticated-fragment-verification}
+\begin{algorithmic}[1]
+\Require Last committed state $\Sigma_{r-1}$ and fragment $\mathcal F_r$
+\Ensure accept or reject
+\State Verify the leader signature, fragment digest, sequence $r$, and
+       predecessor identifier $h_{r-1}$
+\State $(\widehat\Sigma_r,\mathsf{Touched}_r)\gets
+       \mathsf{Apply}(\Sigma_{r-1},\mathcal L_r)$; reject on failure
+\State Verify $\widehat h_r=
+       \mathsf{Commit}(\mathsf{enc}(\widehat\Sigma_r);
+       \mathsf{AUTIG/prestate})$
+\State Recompute $\widehat A_r$ and $\mathsf{Solid}_r$
+\State Check exact key-set coverage of $\mathcal P_r.\mathsf{states}$,
+       $\mathcal P_r.\mathsf{infix}$, and
+       $\mathcal P_r.\mathsf{frontier}$
+\For{each state or weight record in $\mathcal P_r$}
+  \State Require exact equality with the corresponding value in
+         $\widehat\Sigma_r$
+\EndFor
+\If{$F_r=\emptyset$}
+  \State Require $\mathsf{Solid}_r=\emptyset$
+\Else
+  \State Require $\mathsf{Solid}_r\subseteq F_r$
+\EndIf
+\For{each $(x,y)\in(\widehat A_r\setminus F_r)\times F_r$}
+  \State Reject if $\mathsf{EdgePred}_r(x\to y)$
+\EndFor
+\State Reconstruct the proof-induced graph on $F_r$ from authenticated
+       internal weights
+\State Rerun canonical SCC decomposition and deterministic internal
+       linearization; require the resulting order to equal $F_r$
+\State $\Sigma_r\gets\mathsf{Finalize}(\widehat\Sigma_r,F_r)$
+\State Verify the post-state identifier $h_r$
+\State \Return accept
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Checkpointing, Pruning, Recovery, and Handoff}
+\label{sec:checkpoint-recovery-handoff}
+
+\paragraph{Committed live-evidence checkpoints.}
+AUTIG does not reconstruct a new order leader from the proof of the last
+finalized prefix. Instead, every $K$ committed fragments, the underlying BFT
+log records a checkpoint
+\[
+ \mathsf{CP}_r=\langle r,h_r,H(\mathsf{enc}(\Sigma_r)),\mathsf{AvailQC}_r\rangle,
+\]
+where $\mathsf{AvailQC}_r$ contains acknowledgments from $n-f$ replicas that
+they retain the corresponding snapshot. A recovering leader obtains any
+snapshot matching the committed digest and replays the admitted batches and
+finalized prefixes in committed fragments after the checkpoint. Because
+$\mathsf{Apply}$ and $\mathsf{Finalize}$ are deterministic, recovery produces
+the exact current state, including external--external pair contributions.
+
+\paragraph{Soft and hard pruning.}
+Soft pruning may discard only leader-side derived structures, such as cached
+edges, inactive adjacency lists, SCC metadata, and condensation state. It
+must retain the authenticated visibility and pair-contribution records needed
+to reproduce future weights. Hard deletion is permitted after a transaction
+is committed in $F_r$: all later LocalOrders containing that finalized
+identifier are inadmissible, so evidence incident to it cannot constrain a
+future fragment. Historical proof records remain available in the committed
+fragment log. Unfinalized evidence cannot be hard-deleted merely because it
+is stale; a separate BFT-committed retirement rule would be required. AUTIG
+therefore does not claim a strict worst-case bound on adversarially maintained
+live evidence.
+
+\paragraph{Fault and no-progress certificates.}
+An invalid signed fragment provides publicly checkable evidence of order-
+leader misbehavior. After collecting $f+1$ matching
+$\mathsf{OrderFault}$ messages, replicas submit the fault certificate to the
+underlying BFT protocol, which commits an order-leader replacement. Absence
+of a fragment is handled separately: after a locally increasing timeout,
+replicas sign $\mathsf{OrderTimeout}(r,h_{r-1})$. A certificate containing
+$n-f$ such signatures authorizes a handoff. Timeouts affect liveness but not
+safety; after GST, an honest order leader that communicates with $n-f$
+correct replicas eventually completes a fragment before the stabilized
+timeout.
+
+\paragraph{State-transition invariants.}
+The revised protocol maintains the following invariants.
+\begin{enumerate}
+  \item \textbf{Evidence uniqueness.} Each replica contributes at most one
+        direction to each unordered live pair, and $W_r(u,v)\le n$.
+  \item \textbf{Committed-state agreement.} Correct replicas that commit the
+        same fragment sequence derive the same $\Sigma_r$ and $h_r$.
+  \item \textbf{Edge-support closure.} Every edge in the cumulative extraction
+        graph has both endpoints in $A_r$.
+  \item \textbf{Authenticated down-closure.} Every accepted $F_r$ has no
+        incoming edge from $A_r\setminus F_r$ under the exact follower state.
+  \item \textbf{Progress completeness.} Every active Solid transaction is in
+        an accepted non-empty prefix, and an empty prefix is accepted only
+        when no active Solid transaction exists.
+  \item \textbf{Live-evidence continuity.} Finalization removes only evidence
+        incident to finalized transactions; all external--external evidence
+        remains in the next state and in every subsequent checkpoint.
+  \item \textbf{Exact recovery.} Checkpoint restoration followed by committed
+        transition replay yields the same state as uninterrupted execution.
+\end{enumerate}
+
+\paragraph{Cost and scope.}
+Authenticated light-state verification deliberately trades follower storage
+and deterministic evidence updates for avoiding follower-side maintenance of
+the materialized UTIG and full-graph SCC/topological extraction. Sparse
+per-replica contribution maps require $O(n|A_r|^2)$ bits in the worst case,
+while cached aggregate weights require $O(|A_r|^2)$ counters. The proof and
+frontier remain quadratic in the worst case. These costs must be reported as
+protocol tradeoffs; the present ordering-dataplane evaluation does not yet
+measure them.
