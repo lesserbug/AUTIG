@@ -1,22 +1,18 @@
 {
   "key": {
     "name": "aws",
-    "path": "/Users/alberto/.ssh/aws"
+    "path": "/home/ren/.ssh/mrv-aws"
   },
   "port": 5000,
   "repo": {
     "name": "utig",
-    "url": "",
+    "url": "https://github.com/lesserbug/AUTIG.git",
     "branch": "master"
   },
   "instances": {
-    "type": "m5d.8xlarge",
+    "type": "m5.xlarge",
     "regions": [
-      "us-east-1",
-      "eu-north-1",
-      "ap-southeast-2",
-      "us-west-1",
-      "ap-northeast-1"
+      "us-east-1"
     ]
   }
 }
