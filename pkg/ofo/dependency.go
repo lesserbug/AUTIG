@@ -162,9 +162,12 @@ func applyEvidence(state *EvidenceState, orders []*types.LocalOrder, epoch, frag
 
 	senders := make(map[uint64]bool, len(orders))
 	resolved := make(map[types.TxID]types.TxID)
-	for _, order := range orders {
+	for index, order := range orders {
 		if order == nil {
 			return nil, nil, fmt.Errorf("evidence batch contains a nil extension")
+		}
+		if index > 0 && orders[index-1].ReplicaID >= order.ReplicaID {
+			return nil, nil, fmt.Errorf("evidence senders are not in canonical order")
 		}
 		if senders[order.ReplicaID] {
 			return nil, nil, fmt.Errorf("duplicate evidence sender %d", order.ReplicaID)

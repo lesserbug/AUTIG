@@ -120,15 +120,17 @@ def _command(parameters, node_ids, config="config.json", binary=None):
 def _duration_ms(value):
     if value == "N/A":
         return None
-    units = (("ns", 0.000001), ("us", 0.001), ("µs", 0.001), ("ms", 1), ("s", 1000))
-    for suffix, multiplier in units:
-        if value.endswith(suffix):
-            return float(value[: -len(suffix)]) * multiplier
+    units = {"ns": 0.000001, "us": 0.001, "µs": 0.001, "ms": 1, "s": 1000, "m": 60000, "h": 3600000}
+    parts = re.findall(r"([0-9.]+)(ns|us|µs|ms|s|m|h)", value)
+    if parts and "".join(number + unit for number, unit in parts) == value:
+        return sum(float(number) * units[unit] for number, unit in parts)
     raise RuntimeError(f"unknown Go duration {value!r}")
 
 
 def _parse_log(path):
     text = Path(path).read_text(encoding="utf-8", errors="replace")
+    if any(marker in text for marker in ("Verification FAILED", "BENCHMARK INVALID", "Order leader rejected", "panic:")):
+        raise RuntimeError(f"{path} reports a failed benchmark")
     patterns = {
         "measurement_duration": r"Measurement Duration:\s*(\S+)",
         "submitted": r"Total Submitted:\s*(\d+)",
@@ -159,11 +161,20 @@ def _parse_log(path):
         "locally_failed_local_order_send_attempts": text.count("BENCHMARK LOCAL SEND FAILURE: LocalOrder"),
         "locally_failed_autig_candidate_send_attempts": text.count("BENCHMARK LOCAL SEND FAILURE: AUTIGCandidate"),
         "locally_failed_benchmark_commit_send_attempts": text.count("BENCHMARK LOCAL SEND FAILURE: BenchmarkAUTIGCommit"),
+        "replica_states": {
+            replica: (seq, state, digest)
+            for replica, seq, state, digest in re.findall(
+                r"BENCHMARK STATE replica=(\d+) seq=(\d+) state=([0-9a-f]{64}) fragment=([0-9a-f]{64})", text
+            )
+        },
     }
     return metrics
 
 
 def _write_result(mode, parameters, run, metrics):
+    states = metrics["replica_states"]
+    if set(states) != {str(i) for i in range(parameters["nodes"])} or len(set(states.values())) != 1:
+        raise RuntimeError("replicas did not report the same final committed sequence, state and fragment")
     cutoff_seconds = metrics["measurement_duration_ms"] / 1000
     configured_rate = parameters["rate"]
     actual_rate = metrics["submitted"] / cutoff_seconds
@@ -416,6 +427,14 @@ def _run_remote_once(records, settings, parameters, run):
             f"-run{run}-node{replica_id}.log"
         )
         text = path.read_text(encoding="utf-8", errors="replace")
+        if any(marker in text for marker in ("Verification FAILED", "BENCHMARK INVALID", "Order leader rejected", "panic:")):
+            raise RuntimeError(f"{path} reports a failed benchmark")
+        metrics["replica_states"].update({
+            replica: (seq, state, digest)
+            for replica, seq, state, digest in re.findall(
+                r"BENCHMARK STATE replica=(\d+) seq=(\d+) state=([0-9a-f]{64}) fragment=([0-9a-f]{64})", text
+            )
+        })
         metrics["locally_failed_local_order_send_attempts"] += text.count("BENCHMARK LOCAL SEND FAILURE: LocalOrder")
         metrics["locally_failed_autig_candidate_send_attempts"] += text.count("BENCHMARK LOCAL SEND FAILURE: AUTIGCandidate")
         metrics["locally_failed_benchmark_commit_send_attempts"] += text.count("BENCHMARK LOCAL SEND FAILURE: BenchmarkAUTIGCommit")

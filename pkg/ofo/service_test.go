@@ -237,13 +237,13 @@ func TestFirstReceiptOrderSurvivesBlockedAdmission(t *testing.T) {
 func TestCollectorWaitsForRoundOutcomeAndDropsCommittedRetransmissions(t *testing.T) {
 	pipelineCtx, pipelineCancel := context.WithCancel(context.Background())
 	service := &OFOService{
-		committed:          NewEvidenceState(1, 4, [32]byte{}),
+		committed:          NewEvidenceState(1, 5, [32]byte{}),
 		pipelineCtx:        pipelineCtx,
 		pipelineCancel:     pipelineCancel,
 		localOrderChan:     make(chan *types.LocalOrder, 16),
 		batchReadyChan:     make(chan []*types.LocalOrder, 2),
 		collectorRoundDone: make(chan struct{}),
-		replicaCount:       4,
+		replicaCount:       5,
 		fFaulty:            1,
 	}
 	service.pipelineWg.Add(1)
@@ -253,19 +253,19 @@ func TestCollectorWaitsForRoundOutcomeAndDropsCommittedRetransmissions(t *testin
 		service.pipelineWg.Wait()
 	}()
 
-	for sender := uint64(0); sender < 3; sender++ {
+	for sender := uint64(1); sender < 5; sender++ {
 		service.localOrderChan <- &types.LocalOrder{ReplicaID: sender, FragmentSeq: 1}
 	}
 	select {
 	case batch := <-service.batchReadyChan:
-		if len(batch) != 3 {
-			t.Fatalf("collector emitted %d extensions, want 3", len(batch))
+		if len(batch) != 4 {
+			t.Fatalf("collector emitted %d extensions, want 4", len(batch))
 		}
 	case <-time.After(time.Second):
 		t.Fatal("collector did not emit the first batch")
 	}
 
-	for sender := uint64(0); sender < 3; sender++ {
+	for sender := uint64(1); sender < 5; sender++ {
 		service.localOrderChan <- &types.LocalOrder{ReplicaID: sender, FragmentSeq: 1}
 	}
 	select {
@@ -283,13 +283,13 @@ func TestCollectorWaitsForRoundOutcomeAndDropsCommittedRetransmissions(t *testin
 		t.Fatal("collector was not waiting for the round outcome")
 	}
 
-	for sender := uint64(0); sender < 3; sender++ {
+	for _, sender := range []uint64{2, 3, 4, 0} {
 		service.localOrderChan <- &types.LocalOrder{ReplicaID: sender, FragmentSeq: 2}
 	}
 	select {
 	case batch := <-service.batchReadyChan:
-		if len(batch) != 3 {
-			t.Fatalf("collector emitted %d extensions, want 3", len(batch))
+		if len(batch) != 4 {
+			t.Fatalf("collector emitted %d extensions, want 4", len(batch))
 		}
 		for _, order := range batch {
 			if order.FragmentSeq != 2 {
@@ -298,5 +298,96 @@ func TestCollectorWaitsForRoundOutcomeAndDropsCommittedRetransmissions(t *testin
 		}
 	case <-time.After(time.Second):
 		t.Fatal("collector did not emit the next committed-sequence batch")
+	}
+}
+
+func TestOmittedLocalOrderRetainsChunk(t *testing.T) {
+	auth := newTestAuthenticator(t, 5)
+	admission := newTestAdmission()
+	net := newTestNetwork()
+	var sent []*types.LocalOrder
+	net.Register(0, func(msg network.Message) { sent = append(sent, msg.Payload.(*types.LocalOrder)) })
+	s, err := NewOFOService(1, 5, 1, 1, net, 10, nil, false, auth, admission, types.AuthContext{Epoch: 1, LeaderID: 0}, types.ProtocolGenesis{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []string{"x", "y"} {
+		b := []byte(value)
+		s.HandleMessage(network.Message{Payload: &types.Transaction{ID: types.TransactionID(b), CanonicalBytes: b}})
+		if value == "x" {
+			s.GenerateAndSendLocalOrder()
+		}
+	}
+	s.committed.FragmentSeq = 1
+	s.applyCommittedLocalOrder(nil)
+	s.GenerateAndSendLocalOrder()
+	if len(sent) != 2 || !sameIDs(sent[0].OrderedTxs, sent[1].OrderedTxs) || len(sent[1].OrderedTxs) != 1 || sent[1].FragmentSeq != 2 || sent[0].NewHead != sent[1].NewHead {
+		t.Fatal("omitted chunk was resampled or not re-signed for the next sequence")
+	}
+	if !auth.VerifyReplica(1, types.LocalOrderDigest(sent[1]), sent[1].Signature) {
+		t.Fatal("invalid renewed signature")
+	}
+}
+
+func TestCandidateReplacementAndMeasurementDeadline(t *testing.T) {
+	for _, expired := range []bool{false, true} {
+		t.Run(map[bool]string{false: "before cutoff", true: "after cutoff"}[expired], func(t *testing.T) {
+			auth := newTestAuthenticator(t, 2)
+			admission := newTestAdmission()
+			s, err := NewOFOService(0, 2, 0, 1, newTestNetwork(), 10, nil, false, auth, admission, types.AuthContext{Epoch: 1, LeaderID: 0}, types.ProtocolGenesis{}, func(*types.VerifiableFairOrderFragment, [32]byte) {})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Stop()
+			b := []byte("measured")
+			id := types.TransactionID(b)
+			s.HandleMessage(network.Message{Payload: &types.Transaction{ID: id, CanonicalBytes: b, SubmissionTime: time.Now()}})
+			empty, err := s.constructCandidate([]*types.LocalOrder{signedOrder(t, auth, s.committed, 0, 1), signedOrder(t, auth, s.committed, 1, 1)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			original := s.CommittedStateID()
+			follower, err := NewOFOService(1, 2, 0, 1, newTestNetwork(), 10, nil, false, auth, admission, types.AuthContext{Epoch: 1, LeaderID: 0}, types.ProtocolGenesis{}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !follower.verifyCandidate(empty.fragment, 0) || !follower.AbandonPending(empty.digest) {
+				t.Fatal("follower did not verify and abandon first candidate")
+			}
+			if !s.AbandonPending(empty.digest) || s.CommittedStateID() != original {
+				t.Fatal("abandon changed committed state")
+			}
+			candidate, err := s.constructCandidate([]*types.LocalOrder{signedOrder(t, auth, s.committed, 1, 1, id), signedOrder(t, auth, s.committed, 0, 1, id)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if candidate.fragment.Evidence[0].ReplicaID != 0 {
+				t.Fatal("candidate evidence not canonical")
+			}
+			if !follower.verifyCandidate(candidate.fragment, 0) {
+				t.Fatal("follower rejected same-sequence replacement")
+			}
+			if _, ok := s.CommitPending(empty.digest); ok {
+				t.Fatal("abandoned candidate committed")
+			}
+			s.MeasurementDeadline = time.Now().Add(time.Hour)
+			if expired {
+				s.MeasurementDeadline = time.Now().Add(-time.Second)
+			}
+			if _, ok := s.CommitPending(candidate.digest); !ok {
+				t.Fatal("replacement did not commit")
+			}
+			if _, ok := follower.CommitPending(candidate.digest); !ok || follower.CommittedStateID() != s.CommittedStateID() {
+				t.Fatal("replacement committed states disagree")
+			}
+			count, _, samples := s.GetMeasurementStats()
+			want := 1
+			if expired {
+				want = 0
+			}
+			if count != want || samples != int64(want) || s.GetFinalizedCount() != 1 {
+				t.Fatalf("count=%d samples=%d, want measured=%d and committed=1", count, samples, want)
+			}
+		})
 	}
 }

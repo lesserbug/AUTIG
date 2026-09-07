@@ -275,6 +275,8 @@ func (n *DistributedNetwork) Send(msg Message) bool {
 	}
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
+	// Bound blocked writes so benchmark shutdown cannot wait indefinitely.
+	_ = pc.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	if err := pc.enc.Encode(msg); err != nil {
 		n.mu.Lock()
 		if c, ok := n.connections[msg.To]; ok && c == pc {

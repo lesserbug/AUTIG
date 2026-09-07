@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"sort"
 	"sync"
 	"time"
 )
@@ -65,6 +66,9 @@ type OFOService struct {
 
 	totalLatency             time.Duration
 	finalizedCountForLatency int64
+	measuredFinalized        int
+	// Set before the first commit; zero leaves measurement unrestricted.
+	MeasurementDeadline time.Time
 }
 
 func NewOFOService(replicaID, n, f uint64, gamma float64, net network.NetworkInterface, loMaxSize int, loInterval *int, isMalicious bool, auth types.Authenticator, admission types.TransactionAdmission, authContext types.AuthContext, genesis types.ProtocolGenesis, onCandidate CandidateHandler) (*OFOService, error) {
@@ -169,6 +173,18 @@ func (s *OFOService) GenerateAndSendLocalOrder() {
 	s.rwMu.Lock()
 	if s.localOrderPending != nil {
 		order := cloneLocalOrder(s.localOrderPending)
+		if order.FragmentSeq != s.committed.FragmentSeq+1 || order.Epoch != s.authContext.Epoch {
+			order.FragmentSeq = s.committed.FragmentSeq + 1
+			order.Epoch = s.authContext.Epoch
+			signature, err := s.auth.SignReplica(s.ReplicaID, types.LocalOrderDigest(order))
+			if err != nil {
+				s.rwMu.Unlock()
+				log.Printf("Replica %d could not re-sign LocalOrder: %v", s.ReplicaID, err)
+				return
+			}
+			order.Signature = signature
+			s.localOrderPending = cloneLocalOrder(order)
+		}
 		s.rwMu.Unlock()
 		s.sendLocalOrder(order)
 		return
@@ -184,7 +200,7 @@ func (s *OFOService) GenerateAndSendLocalOrder() {
 		}
 	}
 	order := &types.LocalOrder{
-		ReplicaID: s.ReplicaID, Epoch: s.committed.Epoch, FragmentSeq: s.committed.FragmentSeq + 1,
+		ReplicaID: s.ReplicaID, Epoch: s.authContext.Epoch, FragmentSeq: s.committed.FragmentSeq + 1,
 		PrevPosition: s.committed.Seq[s.ReplicaID], PrevHead: s.committed.Head[s.ReplicaID], OrderedTxs: ids,
 	}
 	order.NewPosition = order.PrevPosition + uint64(len(ids))
@@ -221,6 +237,7 @@ func (s *OFOService) runCollectorStage() {
 	if !timer.Stop() {
 		<-timer.C
 	}
+	defer timer.Stop()
 	sendBatch := func() {
 		if len(pending) == 0 {
 			return
@@ -233,9 +250,16 @@ func (s *OFOService) runCollectorStage() {
 		case <-s.pipelineCtx.Done():
 			return
 		}
-		select {
-		case <-s.collectorRoundDone:
-		case <-s.pipelineCtx.Done():
+		for {
+			select {
+			case <-s.collectorRoundDone:
+				return
+			case <-s.localOrderChan:
+				// Replicas retransmit pending chunks. Drain while awaiting commit
+				// so their messages cannot block verification acknowledgements.
+			case <-s.pipelineCtx.Done():
+				return
+			}
 		}
 	}
 	for {
@@ -245,6 +269,9 @@ func (s *OFOService) runCollectorStage() {
 			expectedFragmentSeq := s.committed.FragmentSeq + 1
 			s.rwMu.RUnlock()
 			if order.FragmentSeq != expectedFragmentSeq {
+				continue
+			}
+			if order.ReplicaID >= s.replicaCount || (order.ReplicaID+s.replicaCount-expectedFragmentSeq%s.replicaCount)%s.replicaCount >= requiredOrders {
 				continue
 			}
 			if len(pending) == 0 {
@@ -313,6 +340,8 @@ func (s *OFOService) constructCandidate(orders []*types.LocalOrder) (*pendingCan
 	if s.pending != nil {
 		return nil, fmt.Errorf("a candidate is already pending")
 	}
+	orders = append([]*types.LocalOrder(nil), orders...)
+	sort.Slice(orders, func(i, j int) bool { return orders[i].ReplicaID < orders[j].ReplicaID })
 	preState := s.committed.clone()
 	manager := s.UtigManager.clone()
 	fragmentSeq := s.committed.FragmentSeq + 1
@@ -406,15 +435,21 @@ func (s *OFOService) CommitPending(digest [32]byte) ([]types.FairnessBatch, bool
 	}
 	s.applyCommittedLocalOrder(candidate.fragment.Evidence)
 	finalizeTime := time.Now()
+	measured := s.MeasurementDeadline.IsZero() || finalizeTime.Before(s.MeasurementDeadline)
 	for _, batch := range candidate.fragment.FinalOrder.Batches {
 		for _, id := range batch.Transactions {
+			if measured {
+				s.measuredFinalized++
+			}
 			if submitted, ok := s.txSubmissionTimes[id]; ok {
 				latency := finalizeTime.Sub(submitted)
 				if latency < 0 {
 					latency = 0
 				}
-				s.totalLatency += latency
-				s.finalizedCountForLatency++
+				if measured {
+					s.totalLatency += latency
+					s.finalizedCountForLatency++
+				}
 				delete(s.txSubmissionTimes, id)
 			}
 		}
@@ -457,11 +492,23 @@ func (s *OFOService) applyCommittedLocalOrder(orders []*types.LocalOrder) {
 			s.localOrderPending = nil
 		}
 	}
-	// An extension omitted from this committed fragment keeps its receipt queue,
-	// but must be re-signed for the next fragment sequence.
-	if s.localOrderPending != nil && s.localOrderPending.FragmentSeq <= s.committed.FragmentSeq {
-		s.localOrderPending = nil
+	// An omitted extension retains its exact chunk and is re-signed on next send.
+}
+
+func (s *OFOService) GetMeasurementStats() (int, time.Duration, int64) {
+	s.rwMu.RLock()
+	defer s.rwMu.RUnlock()
+	var average time.Duration
+	if s.finalizedCountForLatency > 0 {
+		average = s.totalLatency / time.Duration(s.finalizedCountForLatency)
 	}
+	return s.measuredFinalized, average, s.finalizedCountForLatency
+}
+
+func (s *OFOService) CommittedContext() (uint64, [32]byte, [32]byte) {
+	s.rwMu.RLock()
+	defer s.rwMu.RUnlock()
+	return s.committed.FragmentSeq, s.committed.StateID, s.latestCommittedFragment
 }
 
 func (s *OFOService) GetFinalizedCount() int {

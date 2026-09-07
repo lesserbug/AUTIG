@@ -31,6 +31,8 @@ func init() {
 	gob.Register(&benchmarkReady{})
 	gob.Register(&benchmarkStart{})
 	gob.Register(&benchmarkFragmentCommit{})
+	gob.Register(&benchmarkVerified{})
+	gob.Register(&benchmarkFinish{})
 }
 
 // --- 将这些常量作为命令行标志的默认值 ---
@@ -125,6 +127,7 @@ func runDistributedMode(rootCtx context.Context, nodeIDs []uint64, maliciousThre
 	localStarted := make(chan struct{}, len(nodeIDs))
 	localInitFailed := make(chan struct{}, len(nodeIDs))
 	var experimentCtx context.Context
+	submissionDone := make(chan struct{})
 
 	services := make(map[uint64]*ofo.OFOService)
 	var servicesMu sync.Mutex
@@ -175,8 +178,15 @@ func runDistributedMode(rootCtx context.Context, nodeIDs []uint64, maliciousThre
 			var hosting *benchmarkHostingAdapter
 			var candidateHandler ofo.CandidateHandler
 			if id == authContext.LeaderID {
-				hosting = &benchmarkHostingAdapter{network: net, replicaCount: totalNodes, leaderID: authContext.LeaderID, ready: make(chan struct{})}
-				candidateHandler = hosting.Propose
+				hosting = &benchmarkHostingAdapter{network: net, replicaCount: totalNodes, faultCount: faultCount, leaderID: authContext.LeaderID, ready: make(chan struct{}), verified: make(chan network.Message, 2*totalNodes)}
+				candidateHandler = func(fragment *types.VerifiableFairOrderFragment, digest [32]byte) {
+					select {
+					case <-experimentStart:
+					case <-ctx.Done():
+						return
+					}
+					hosting.Propose(experimentCtx, fragment, digest)
+				}
 			}
 			service, err := ofo.NewOFOService(id, totalNodes, faultCount, gamma, net, loSize, &loIntervalMs, isMalicious, authenticator, admission, authContext, genesis, candidateHandler)
 			if err != nil {
@@ -198,6 +208,8 @@ func runDistributedMode(rootCtx context.Context, nodeIDs []uint64, maliciousThre
 				network:      net,
 				start:        start,
 				readySenders: make(map[uint64]struct{}),
+				hosting:      hosting,
+				finished:     make(chan struct{}),
 			}
 			net.Register(id, adapter.HandleMessage)
 
@@ -228,17 +240,63 @@ func runDistributedMode(rootCtx context.Context, nodeIDs []uint64, maliciousThre
 
 			loGenTicker := time.NewTicker(time.Duration(loIntervalMs) * time.Millisecond)
 			defer loGenTicker.Stop()
+			loCtx := experimentCtx
+			if hosting == nil {
+				// Followers keep producing evidence until the leader's finish marker;
+				// their independently received Start must not shorten its window.
+				var stopLO context.CancelFunc
+				loCtx, stopLO = context.WithTimeout(ctx, time.Duration(simDuration+30)*time.Second)
+				defer stopLO()
+			}
 
 		loGenLoop:
 			for {
 				select {
 				case <-loGenTicker.C:
-					if experimentCtx.Err() != nil {
+					if loCtx.Err() != nil {
 						break loGenLoop
 					}
 					service.GenerateAndSendLocalOrder()
-				case <-experimentCtx.Done():
+				case <-loCtx.Done():
 					break loGenLoop
+				case <-adapter.finished:
+					break loGenLoop
+				}
+			}
+			if hosting != nil {
+				service.Stop()
+				<-submissionDone
+				seq, state, digest := service.CommittedContext()
+				log.Printf("BENCHMARK STATE replica=%d seq=%d state=%x fragment=%x", id, seq, state, digest)
+				for peer := uint64(0); peer < totalNodes; peer++ {
+					if peer != id && !net.Send(network.Message{Type: "BenchmarkFinish", From: id, To: peer, Payload: &benchmarkFinish{}}) {
+						log.Printf("BENCHMARK INVALID: finish send failed to replica %d", peer)
+					}
+				}
+				finishCtx, stopFinish := context.WithTimeout(ctx, 30*time.Second)
+				finishedPeers := map[uint64]bool{id: true}
+			finishLoop:
+				for uint64(len(finishedPeers)) < totalNodes {
+					select {
+					case message := <-hosting.verified:
+						if _, ok := message.Payload.(*benchmarkFinish); ok {
+							finishedPeers[message.From] = true
+						}
+					case <-finishCtx.Done():
+						log.Println("BENCHMARK INVALID: final state barrier did not complete")
+						break finishLoop
+					}
+				}
+				stopFinish()
+			} else {
+				// Keep receiving the final committed prefix after measurement stops.
+				select {
+				case <-adapter.finished:
+					if !net.Send(network.Message{Type: "BenchmarkFinish", From: id, To: authContext.LeaderID, Payload: &benchmarkFinish{}}) {
+						log.Printf("BENCHMARK INVALID: finish acknowledgement failed at replica %d", id)
+					}
+				case <-loCtx.Done():
+					log.Printf("BENCHMARK INVALID: replica %d did not receive finish", id)
 				}
 			}
 			log.Printf("Node %d shutting down...", id)
@@ -261,11 +319,13 @@ func runDistributedMode(rootCtx context.Context, nodeIDs []uint64, maliciousThre
 	experimentStartTime := time.Now()
 	experimentCtx, experimentCancel := context.WithDeadline(ctx, experimentStartTime.Add(measurementDuration))
 	defer experimentCancel()
+	if isLeaderInstance {
+		services[authContext.LeaderID].MeasurementDeadline = experimentStartTime.Add(measurementDuration)
+	}
 	close(experimentStart)
 
 	var submittedTxCount int32
 	var failedTxSends int64
-	submissionDone := make(chan struct{})
 	if isLeaderInstance {
 		wg.Add(1)
 		go func() {
@@ -305,11 +365,13 @@ func submitTransactions(ctx context.Context, net network.NetworkInterface, sende
 	defer ticker.Stop()
 
 	txCounter := 0
+	deadline, hasDeadline := ctx.Deadline()
 	log.Println("Transaction submission started.")
 	for {
 		select {
 		case <-ticker.C:
-			if ctx.Err() != nil {
+			submittedAt := time.Now()
+			if ctx.Err() != nil || (hasDeadline && !submittedAt.Before(deadline)) {
 				log.Println("Transaction submission stopping...")
 				return
 			}
@@ -322,7 +384,7 @@ func submitTransactions(ctx context.Context, net network.NetworkInterface, sende
 			tx := types.Transaction{
 				ID:             types.TransactionID(canonical),
 				CanonicalBytes: canonical,
-				SubmissionTime: time.Now(),
+				SubmissionTime: submittedAt,
 			}
 
 			for i := uint64(0); i < totalNodes; i++ {
@@ -356,7 +418,7 @@ func monitorWithLeader(ctx context.Context, leaderService *ofo.OFOService, submi
 	for {
 		select {
 		case <-ticker.C:
-			finalizedCount := leaderService.GetFinalizedCount()
+			finalizedCount, avgLatency, latencyCount := leaderService.GetMeasurementStats()
 			utigSize := leaderService.GetUTIGNodeCount()
 			submittedCount := atomic.LoadInt32(submittedCounter)
 			elapsed := time.Since(startTime).Seconds()
@@ -366,7 +428,6 @@ func monitorWithLeader(ctx context.Context, leaderService *ofo.OFOService, submi
 			tps := float64(finalizedCount) / elapsed
 
 			// <<< ADDED >>> 获取并格式化延迟数据
-			avgLatency, latencyCount := leaderService.GetLatencyStats()
 			latencyStr := "N/A"
 			if latencyCount > 0 {
 				latencyStr = avgLatency.Round(time.Millisecond).String()
@@ -379,29 +440,15 @@ func monitorWithLeader(ctx context.Context, leaderService *ofo.OFOService, submi
 		case <-ctx.Done():
 			fmt.Println("\nSimulation time ended.")
 			<-submissionDone
-			var finalizedCount int
-			var finalAvgLatency time.Duration
-			var latencySamples int64
-			var totalSubmitted int32
-			var failedSends int64
-			var cutoffDuration time.Duration
-			for {
-				before := leaderService.GetFinalizedCount()
-				avgLatency, samples := leaderService.GetLatencyStats()
-				submitted := atomic.LoadInt32(submittedCounter)
-				failed := atomic.LoadInt64(failedSendCounter)
-				after := leaderService.GetFinalizedCount()
-				if before == after {
-					finalizedCount = after
-					finalAvgLatency = avgLatency
-					latencySamples = samples
-					totalSubmitted = submitted
-					failedSends = failed
-					cutoffDuration = time.Since(startTime)
-					break
-				}
+			finalizedCount, finalAvgLatency, latencySamples := leaderService.GetMeasurementStats()
+			totalSubmitted := atomic.LoadInt32(submittedCounter)
+			failedSends := atomic.LoadInt64(failedSendCounter)
+			deadline, _ := ctx.Deadline()
+			if time.Now().Before(deadline) {
+				log.Println("BENCHMARK INVALID: measurement cancelled before deadline")
+				return
 			}
-			printFinalReport(cutoffDuration, finalizedCount, totalSubmitted, failedSends, finalAvgLatency, latencySamples)
+			printFinalReport(deadline.Sub(startTime), finalizedCount, totalSubmitted, failedSends, finalAvgLatency, latencySamples)
 			return
 		}
 	}

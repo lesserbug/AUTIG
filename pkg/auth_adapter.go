@@ -5,6 +5,7 @@ import (
 	"SpeedFair_simplify/pkg/ofo"
 	"SpeedFair_simplify/pkg/types"
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"crypto/x509"
@@ -239,6 +240,13 @@ type benchmarkFragmentCommit struct {
 	Digest [32]byte
 }
 
+type benchmarkVerified struct {
+	Digest   [32]byte
+	Accepted bool
+}
+
+type benchmarkFinish struct{}
+
 type benchmarkNodeAdapter struct {
 	service      *ofo.OFOService
 	replicaID    uint64
@@ -250,7 +258,8 @@ type benchmarkNodeAdapter struct {
 	mu           sync.Mutex
 	readySenders map[uint64]struct{}
 	started      bool
-	deferred     *[32]byte
+	hosting      *benchmarkHostingAdapter
+	finished     chan struct{}
 }
 
 func (adapter *benchmarkNodeAdapter) HandleMessage(message network.Message) {
@@ -294,57 +303,87 @@ func (adapter *benchmarkNodeAdapter) HandleMessage(message network.Message) {
 			adapter.startOnce.Do(func() { close(adapter.start) })
 		}
 		return
+	case *benchmarkVerified:
+		if adapter.hosting != nil && message.From < adapter.replicaCount {
+			adapter.hosting.verified <- message
+		}
+		return
+	case *benchmarkFinish:
+		if adapter.hosting != nil && message.From < adapter.replicaCount {
+			adapter.hosting.verified <- message
+		} else if message.From == adapter.leaderID {
+			seq, state, digest := adapter.service.CommittedContext()
+			log.Printf("BENCHMARK STATE replica=%d seq=%d state=%x fragment=%x", adapter.replicaID, seq, state, digest)
+			close(adapter.finished)
+		}
+		return
 	}
 
 	commit, isCommit := message.Payload.(*benchmarkFragmentCommit)
 	if !isCommit {
 		adapter.service.HandleMessage(message)
-		if _, isCandidate := message.Payload.(*types.VerifiableFairOrderFragment); isCandidate {
-			adapter.applyDeferred()
+		if candidate, isCandidate := message.Payload.(*types.VerifiableFairOrderFragment); isCandidate {
+			digest := types.FragmentDigest(candidate)
+			pending, ok := adapter.service.PendingDigest()
+			if !adapter.network.Send(network.Message{Type: "BenchmarkVerified", From: adapter.replicaID, To: adapter.leaderID, Payload: &benchmarkVerified{Digest: digest, Accepted: ok && pending == digest}}) {
+				log.Printf("BENCHMARK INVALID: verification acknowledgement send failed at replica %d", adapter.replicaID)
+			}
 		}
 		return
 	}
 	if message.From != adapter.leaderID {
 		return
 	}
-	if _, committed := adapter.service.CommitPending(commit.Digest); committed {
-		return
-	}
-	adapter.mu.Lock()
-	digest := commit.Digest
-	adapter.deferred = &digest
-	adapter.mu.Unlock()
-}
-
-func (adapter *benchmarkNodeAdapter) applyDeferred() {
-	adapter.mu.Lock()
-	deferred := adapter.deferred
-	adapter.deferred = nil
-	adapter.mu.Unlock()
-	if deferred != nil {
-		_, _ = adapter.service.CommitPending(*deferred)
+	if _, committed := adapter.service.CommitPending(commit.Digest); !committed {
+		log.Printf("BENCHMARK INVALID: commit without matching verified candidate at replica %d", adapter.replicaID)
 	}
 }
 
-// benchmarkHostingAdapter keeps the benchmark's immediate progress behavior,
-// while proposal verification and commit remain distinct OFOService events.
+// This fixed-leader benchmark gate waits for n-f validations. It is not BFT consensus.
 type benchmarkHostingAdapter struct {
 	network      network.NetworkInterface
 	replicaCount uint64
 	leaderID     uint64
 	leader       *ofo.OFOService
 	ready        chan struct{}
+	faultCount   uint64
+	verified     chan network.Message
 }
 
-func (adapter *benchmarkHostingAdapter) Propose(fragment *types.VerifiableFairOrderFragment, digest [32]byte) {
+func (adapter *benchmarkHostingAdapter) Propose(ctx context.Context, fragment *types.VerifiableFairOrderFragment, digest [32]byte) {
 	<-adapter.ready
+	defer adapter.leader.AbandonPending(digest)
+	if ctx.Err() != nil {
+		return
+	}
 	for replicaID := uint64(0); replicaID < adapter.replicaCount; replicaID++ {
 		if replicaID == adapter.leaderID {
 			continue
 		}
 		if !adapter.network.Send(network.Message{Type: "AUTIGCandidate", From: adapter.leaderID, To: replicaID, Payload: fragment}) {
 			log.Printf("BENCHMARK LOCAL SEND FAILURE: AUTIGCandidate to replica %d", replicaID)
+			return
 		}
+	}
+	accepted := map[uint64]bool{adapter.leaderID: true}
+	for uint64(len(accepted)) < adapter.replicaCount-adapter.faultCount {
+		select {
+		case message := <-adapter.verified:
+			ack := message.Payload.(*benchmarkVerified)
+			if ack.Digest != digest || message.From >= adapter.replicaCount || accepted[message.From] {
+				continue
+			}
+			if !ack.Accepted {
+				log.Printf("BENCHMARK INVALID: candidate rejected by replica %d", message.From)
+				return
+			}
+			accepted[message.From] = true
+		case <-ctx.Done():
+			return
+		}
+	}
+	if ctx.Err() != nil {
+		return
 	}
 	if _, ok := adapter.leader.CommitPending(digest); !ok {
 		return

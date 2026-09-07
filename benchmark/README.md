@@ -46,3 +46,23 @@ LocalOrder producers and does not mean that those instances are omitted.
 Logs are stored in `benchmark/logs` and parsed JSON results in
 `benchmark/results`. `fab destroy` permanently terminates all AWS instances
 tagged with the default testbed name `autig`.
+
+The fixed-leader benchmark waits for verification acknowledgements from
+`n-f` distinct replicas (including the constructing leader) before its adapter
+simulates commit. These acknowledgements are benchmark control messages, not a
+BFT quorum certificate. Reported latency ends at that leader-side simulated
+commit; it includes quorum verification but excludes a real hosting-BFT round
+and follower commit-notification delivery.
+
+Only submissions and commit events before the leader's fixed measurement
+deadline enter the metrics. Followers continue serving the final prefix until
+the finish barrier; this shutdown time is excluded. The controller rejects
+verification failures, send failures, missing replica reports, and differences
+in final committed sequence, state ID, or fragment digest. TCP writes have a
+five-second deadline; a timed-out send invalidates the run.
+
+Evidence senders rotate by `(replica_id - fragment_seq) mod n`; the first `n-f`
+priorities are required each round. All configured replicas must keep sending
+LocalOrders in these experiments. A silent scheduled replica can stall this
+prototype because order-leader handoff is not implemented. The existing
+single-generator workload and graph/cache implementation are otherwise retained.

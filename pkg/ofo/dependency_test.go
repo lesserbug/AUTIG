@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"fmt"
+	"sort"
 	"sync"
 	"testing"
 )
@@ -102,6 +103,7 @@ func signedOrder(t *testing.T, auth types.Authenticator, state *EvidenceState, r
 
 func applyAndRefresh(t *testing.T, state *EvidenceState, manager *DependencyManager, auth types.Authenticator, admission types.TransactionAdmission, n, f uint64, gamma float64, orders ...*types.LocalOrder) {
 	t.Helper()
+	sort.Slice(orders, func(i, j int) bool { return orders[i].ReplicaID < orders[j].ReplicaID })
 	touchedNodes, touchedPairs, err := applyEvidence(state, orders, state.Epoch, state.FragmentSeq+1, n, f, gamma, 10, auth, admission)
 	if err != nil {
 		t.Fatal(err)
@@ -230,7 +232,7 @@ func TestCumulativeStateAndTouchedPairReorientEdge(t *testing.T) {
 }
 
 func TestExactSafeClosureAndBlockerPath(t *testing.T) {
-	const n, f = uint64(4), uint64(1)
+	const n, f = uint64(5), uint64(1)
 	const gamma = 1.0
 	admission := newTestAdmission()
 	state := NewEvidenceState(1, n, [32]byte{1})
@@ -261,5 +263,131 @@ func TestExactSafeClosureAndBlockerPath(t *testing.T) {
 	certificate.BlockForest = certificate.BlockForest[:1]
 	if err := verifyStructuralCertificate(state, finalOrder, certificate, n, f, gamma); err == nil {
 		t.Fatal("certificate without the excluded Solid blocker path was accepted")
+	}
+}
+
+func TestCertificateBoundariesFromEvidence(t *testing.T) {
+	const n, f = uint64(5), uint64(1)
+	auth := newTestAuthenticator(t, n)
+	admission := newTestAdmission()
+	a, b, c, d, e, z := testTx(t, admission, 10), testTx(t, admission, 11), testTx(t, admission, 12), testTx(t, admission, 13), testTx(t, admission, 14), testTx(t, admission, 15)
+	state := NewEvidenceState(1, n, [32]byte{})
+	manager := NewDependencyManager(n, f, 1)
+	applyAndRefresh(t, state, manager, auth, admission, n, f, 1,
+		signedOrder(t, auth, state, 0, 1, z, e, a, b, c, d),
+		signedOrder(t, auth, state, 1, 1, z, b, c, a, e, d),
+		signedOrder(t, auth, state, 2, 1, z, c, a, b, d),
+		signedOrder(t, auth, state, 3, 1))
+	for _, name := range []string{"valid", "split SCC", "merge SCCs", "invalid tree", "incoming frontier", "omit safe vertex"} {
+		t.Run(name, func(t *testing.T) {
+			order, cert, err := manager.buildProposal(state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(order.Batches) != 2 || len(order.Batches[1].Transactions) != 3 {
+				t.Fatal("fixture lacks singleton followed by SCC")
+			}
+			switch name {
+			case "split SCC":
+				cycle := order.Batches[1].Transactions
+				order.Batches = order.Batches[:1]
+				cert.Part = cert.Part[:1]
+				for _, id := range cycle {
+					rank := len(cert.Part)
+					order.Batches = append(order.Batches, types.FairnessBatch{Index: uint64(rank + 1), Transactions: []types.TxID{id}})
+					cert.Part = append(cert.Part, types.SCCClaim{Rank: uint64(rank), Transactions: []types.TxID{id}})
+				}
+			case "merge SCCs":
+				merged := append([]types.TxID{z}, order.Batches[1].Transactions...)
+				types.SortTxIDs(merged)
+				order.Batches = []types.FairnessBatch{{Index: 1, Transactions: merged}}
+				cert.Part = []types.SCCClaim{{Transactions: merged, InTree: spanningTree(merged[0], merged, manager.inverseEdges, true), OutTree: spanningTree(merged[0], merged, manager.edges, false)}}
+			case "invalid tree":
+				cert.Part[1].OutTree[0] = types.TreeEdge{From: a, To: a}
+			case "incoming frontier":
+				order.Batches = order.Batches[1:]
+				order.Batches[0].Index = 1
+				cert.Part = cert.Part[1:]
+				cert.Part[0].Rank = 0
+			case "omit safe vertex":
+				order.Batches = nil
+				cert.Part = nil
+			}
+			err = verifyStructuralCertificate(state, order, cert, n, f, 1)
+			if (err == nil) != (name == "valid") {
+				t.Fatalf("unexpected verification result: %v", err)
+			}
+		})
+	}
+}
+
+func TestEmptyClosureAndSharedBlockerPaths(t *testing.T) {
+	// Structural-verifier unit fixture: a Shaded root followed by a Solid chain.
+	const n, f = uint64(5), uint64(1)
+	state := NewEvidenceState(1, n, [32]byte{})
+	manager := NewDependencyManager(n, f, 1)
+	nodes := map[types.TxID]bool{}
+	pairs := map[pairKey]bool{}
+	var previous types.TxID
+	for i := byte(1); i <= 32; i++ {
+		id := types.TxID{i}
+		state.Live[id] = true
+		state.states[id] = types.StateSolid
+		nodes[id] = true
+		if i == 1 {
+			state.states[id] = types.StateShaded
+		} else {
+			state.weights[edgeKey{previous, id}] = 2
+			pairs[makePair(previous, id)] = true
+		}
+		previous = id
+	}
+	manager.refresh(state, nodes, pairs)
+	order, cert, err := manager.buildProposal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(order.Batches) != 0 || len(cert.BlockForest) != 32 {
+		t.Fatal("expected empty closure and shared blocker chain")
+	}
+	if err := verifyStructuralCertificate(state, order, cert, n, f, 1); err != nil {
+		t.Fatal(err)
+	}
+	cert.BlockForest[1].Depth = 0
+	if err := verifyStructuralCertificate(state, order, cert, n, f, 1); err == nil {
+		t.Fatal("invalid blocker depth accepted")
+	}
+}
+
+func TestDelayedFinalizedOccurrencePreservesLivePairs(t *testing.T) {
+	const n, f = uint64(5), uint64(1)
+	auth := newTestAuthenticator(t, n)
+	admission := newTestAdmission()
+	state := NewEvidenceState(1, n, [32]byte{})
+	manager := NewDependencyManager(n, f, 1)
+	u, x, y := testTx(t, admission, 20), testTx(t, admission, 21), testTx(t, admission, 22)
+	applyAndRefresh(t, state, manager, auth, admission, n, f, 1,
+		signedOrder(t, auth, state, 0, 1, u, x, y), signedOrder(t, auth, state, 1, 1, u, x, y), signedOrder(t, auth, state, 2, 1, u), signedOrder(t, auth, state, 3, 1))
+	order, cert, err := manager.buildProposal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(order.Batches) != 1 || !sameIDs(order.Batches[0].Transactions, []types.TxID{u}) {
+		t.Fatal("expected only u safe")
+	}
+	finalize(state, manager, order, cert.Part)
+	if state.weights[edgeKey{x, y}] != 2 {
+		t.Fatal("finalization changed retained pair")
+	}
+	delayed := signedOrder(t, auth, state, 3, 2, u, x, y)
+	orders := []*types.LocalOrder{signedOrder(t, auth, state, 0, 2), signedOrder(t, auth, state, 1, 2), signedOrder(t, auth, state, 2, 2), delayed}
+	unordered := append([]*types.LocalOrder(nil), orders...)
+	unordered[0], unordered[1] = unordered[1], unordered[0]
+	if _, _, err := applyEvidence(state.clone(), unordered, 1, 2, n, f, 1, 10, auth, admission); err == nil {
+		t.Fatal("noncanonical evidence accepted")
+	}
+	applyAndRefresh(t, state, manager, auth, admission, n, f, 1, orders...)
+	if state.Live[u] || state.Pos[3][u] != 0 || state.Seq[3] != 3 || state.Pos[3][x] != 2 || state.weights[edgeKey{x, y}] != 3 {
+		t.Fatal("delayed finalized occurrence broke continuity or pair accounting")
 	}
 }
