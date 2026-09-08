@@ -334,7 +334,7 @@ func runDistributedMode(rootCtx context.Context, nodeIDs []uint64, maliciousThre
 			servicesMu.Lock()
 			net := txSubmitterNet
 			servicesMu.Unlock()
-			submitTransactions(experimentCtx, net, authContext.LeaderID, totalNodes, txRate, txSize, &submittedTxCount, &failedTxSends)
+			submitTransactions(experimentCtx, net, authContext.LeaderID, totalNodes, txRate, txSize, &submittedTxCount, &failedTxSends, experimentStartTime)
 		}()
 	}
 
@@ -349,32 +349,56 @@ func runDistributedMode(rootCtx context.Context, nodeIDs []uint64, maliciousThre
 	fmt.Println("\nAll nodes on this instance have shut down.")
 }
 
-// <<< MODIFIED: 保持不变，但现在它的 context 来自于 main >>>
-func submitTransactions(ctx context.Context, net network.NetworkInterface, senderID, totalNodes uint64, txRate, txSize int, submittedCounter *int32, failedSendCounter *int64) {
+// transactionTarget is the cumulative number due since the measurement start.
+// Split seconds and nanoseconds to avoid overflowing rate * elapsed nanoseconds
+// in ordinary, long benchmark runs.
+func transactionTarget(rate int, elapsed time.Duration) int64 {
+	if rate <= 0 || elapsed <= 0 {
+		return 0
+	}
+	return int64(elapsed/time.Second)*int64(rate) + int64(elapsed%time.Second)*int64(rate)/int64(time.Second)
+}
+
+func submitTransactions(ctx context.Context, net network.NetworkInterface, senderID, totalNodes uint64, txRate, txSize int, submittedCounter *int32, failedSendCounter *int64, startTime time.Time) {
 	if txRate <= 0 {
 		log.Println("Transaction submission rate is 0, no transactions will be submitted.")
 		return
 	}
 
-	// 计算 ticker 间隔，确保不为0
+	// Ticks only wake the scheduler; they do not represent individual arrivals.
+	// Above 1000 tx/s, one wakeup can produce a small group of due transactions.
 	interval := time.Second / time.Duration(txRate)
-	if interval == 0 {
-		interval = time.Nanosecond // 对于非常高的速率，使用最小间隔
+	if interval < time.Millisecond {
+		interval = time.Millisecond
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	txCounter := 0
+	var txCounter int64
 	deadline, hasDeadline := ctx.Deadline()
 	log.Println("Transaction submission started.")
+	defer log.Println("Transaction submission stopping...")
 	for {
-		select {
-		case <-ticker.C:
-			submittedAt := time.Now()
-			if ctx.Err() != nil || (hasDeadline && !submittedAt.Before(deadline)) {
-				log.Println("Transaction submission stopping...")
+		now := time.Now()
+		if ctx.Err() != nil || (hasDeadline && !now.Before(deadline)) {
+			return
+		}
+		expected := transactionTarget(txRate, now.Sub(startTime))
+		if txCounter >= expected {
+			select {
+			case <-ticker.C:
+			case <-ctx.Done():
 				return
 			}
+			continue
+		}
+		for txCounter < expected {
+			submittedAt := time.Now()
+			if ctx.Err() != nil || (hasDeadline && !submittedAt.Before(deadline)) {
+				return
+			}
+			// Count real submission attempts, never scheduled-but-uncreated work.
+			// Keep the real timestamp so catch-up does not backdate latency.
 			txCounter++
 			atomic.AddInt32(submittedCounter, 1)
 			canonical := make([]byte, txSize)
@@ -392,10 +416,10 @@ func submitTransactions(ctx context.Context, net network.NetworkInterface, sende
 					atomic.AddInt64(failedSendCounter, 1)
 				}
 			}
-		case <-ctx.Done():
-			log.Println("Transaction submission stopping...")
-			return // 先返回，再由 defer ticker.Stop() 清理
 		}
+		// Recompute immediately: synchronous fanout may itself have accrued debt.
+		// Finish an already-counted transaction's fanout, but never create new
+		// transactions after the cutoff, even if the target has not been reached.
 	}
 }
 

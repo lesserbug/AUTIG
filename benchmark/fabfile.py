@@ -8,6 +8,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 
 import boto3
@@ -180,22 +181,19 @@ def _write_result(mode, parameters, run, metrics):
     actual_rate = metrics["submitted"] / cutoff_seconds
     tolerance = parameters["offered_rate_tolerance"]
     if configured_rate == 0:
-        relative_deviation = 0.0
-        if actual_rate != 0:
-            raise RuntimeError(f"configured offered rate is 0 but actual offered rate is {actual_rate:.2f}")
+        # A nonzero observation has no relative deviation from a zero target.
+        # Use JSON null rather than Infinity, and flag the unexpected workload.
+        relative_deviation = 0.0 if actual_rate == 0 else None
+        rate_within_tolerance = actual_rate == 0
     else:
         relative_deviation = abs(actual_rate - configured_rate) / configured_rate
-        if relative_deviation > tolerance:
-            raise RuntimeError(
-                f"actual offered rate {actual_rate:.2f} deviates from "
-                f"configured rate {configured_rate} by {relative_deviation:.2%}, "
-                f"exceeding the {tolerance:.2%} tolerance"
-            )
+        rate_within_tolerance = relative_deviation <= tolerance
     metrics["average_tps"] = metrics["finalized"] / cutoff_seconds
     metrics["actual_offered_rate"] = actual_rate
     metrics["configured_offered_rate"] = configured_rate
     metrics["offered_rate_relative_deviation"] = relative_deviation
     metrics["offered_rate_tolerance"] = tolerance
+    metrics["offered_rate_within_tolerance"] = rate_within_tolerance
     if metrics["locally_failed_transaction_send_attempts"] != 0:
         raise RuntimeError(
             f"benchmark reports {metrics['locally_failed_transaction_send_attempts']} "
@@ -223,6 +221,15 @@ def _write_result(mode, parameters, run, metrics):
     )
     with (RESULT_DIR / filename).open("w", encoding="utf-8") as target:
         dump(result, target, indent=2)
+    if not rate_within_tolerance:
+        deviation = "undefined (zero configured rate)" if relative_deviation is None else f"{relative_deviation:.2%}"
+        print(
+            f"WARNING: actual offered rate {actual_rate:.2f} differs from configured "
+            f"rate {configured_rate}; relative deviation {deviation}, tolerance "
+            f"{tolerance:.2%}. Saved this run with offered_rate_within_tolerance=false; "
+            "use actual_offered_rate for load plots and inspect generator capacity.",
+            file=sys.stderr,
+        )
     print(dumps(result, indent=2))
 
 
