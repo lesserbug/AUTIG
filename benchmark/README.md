@@ -192,3 +192,156 @@ This change records the existing network placement; it does not switch routes
 or choose a different AZ. Reject mixed/unknown/dirty deployments when selecting
 formal comparison data, and rerun all node counts on the same committed build.
 These diagnostic fields do not change throughput, latency or tolerance rules.
+
+## Local computation ablations (experiments 3 and 4)
+
+These test-only benchmarks measure one leader or follower's local computation.
+`n=50` means 50 logical replicas' evidence/state, not 50 communicating machines.
+No production code, thresholds, ordering rules, commit semantics, Fabric tasks,
+or deployment modes are changed. One EC2 instance in one region is sufficient.
+
+Use the **final main-experiment parameters** for formal collection. Development
+defaults are `n=10,50`, `f=1`, `gamma=0.9`, matching the current main experiment;
+there is no gamma sweep. Test-binary flags `-ablation-nodes`, `-ablation-f` and
+`-ablation-gamma` permit freezing the final parameters without editing production
+code. The normal service constructor validates them. Fixture checks also fail if
+a requested structure (e.g. a retained SCC) is not actually obtained.
+
+### Samples and correctness gate
+
+Both experiments use the same generator and fixed seeds (default `1,7,19`).
+Canonical transaction content is 512 bytes. Seed changes content/TxIDs and hence
+public-ID ordering and proof traversal. The reception profiles are controlled,
+not sampled AWS traces; seeds do not simulate independent network schedules.
+Real Ed25519 test keys are derived deterministically from the fixture seed outside
+timing, using the existing test authenticator's signing/verification methods.
+Both experiments and independent processes reproduce the same signed candidate;
+both branches share keys and signed evidence. Key derivation/file loading
+is not part of an operation. The test authenticator uses the same Ed25519
+primitives as `fileAuthenticator`; admission uses an in-memory locked content
+store with copying and a no-op `ValidateAdmission`, like the standalone adapter.
+Full results therefore measure this implementation, not arbitrary business
+admission or full BFT consensus.
+
+Each fixture executes a nonempty bootstrap commit, a history round, and another
+committed round retaining that history. Every round uses the collector's rotating
+`n-f` sender set, contiguous signed extensions, normal production construction,
+follower verification and `CommitPending`. No authoritative maps are fabricated.
+
+| Case | Purpose |
+| --- | --- |
+| `common-low` | 12 retained transactions, then release plus 96 fresh transactions; consistent reception and nonempty output. A low-backlog proxy, **not a recorded AWS workload**. |
+| `synthetic-small-many` | 24 retained Shaded transactions, 192 fresh transactions. |
+| `synthetic-large-few` / `synthetic-large-many` | Large retained Shaded history, 8 / 128 fresh transactions. |
+| `synthetic-blocked-solid` | Three Shaded predecessors retain a large Solid history; 8 fresh transactions. |
+| `synthetic-empty-extension` | Signed empty extensions; no effective new positions. |
+| `synthetic-delayed-done` | The replica omitted from bootstrap reports those finalized transactions late; LO positions advance, effective positions do not. |
+| `synthetic-cycle-held` / `synthetic-cycle-release` | Three cyclic block reception orders form a large SCC; keep it blocked or add missing first positions and release it. |
+
+Large history defaults to 480 transactions (`-ablation-history`). Fresh counts
+are unique new transactions, **not** new `(replica, transaction)` positions.
+The release cases additionally report existing live transactions at replicas
+that have not assigned them first positions. The high-backlog/cycle cases are
+legal controlled synthetic sensitivity samples, not claims about workload
+frequency. They cannot attribute a particular AWS throughput change; that needs
+the run's stage logs or replayable inputs.
+
+Before any leaf benchmark timer starts, the exact sample passes graph, output,
+certificate, authoritative/cache state, commit and following-round checks, plus
+production-vs-recompute verifier acceptance. Cache counts are independently
+derived from retained positions outside timing. Graph comparison ignores absent
+zero weights and empty adjacency representation. StateID alone is insufficient:
+`PostStateIdentifier` covers batches and Part membership/rank, whereas
+`FragmentDigest` also covers trees and BlockForest.
+
+The separate differential tests reject malformed evidence, context/signatures,
+wrong batches/order/SCC membership, incomplete or unsafe output, bad trees,
+bad forests and wrong pre/post IDs. Internal mutations are re-signed and tested
+at their intended stage. Alternative valid trees and blocker roots are accepted
+by both verifiers. The tests compare decisions and state effects, not error text.
+
+### Timing boundaries
+
+| Experiment | Core | Full |
+| --- | --- | --- |
+| Graph maintenance | `refresh` versus allocation and complete materialization from the **same already-updated state**. Evidence and restoration of the incremental graph/touch snapshot are outside timing. | Production `constructCandidate` versus a test-only rebuild wrapper: sorting, state copies, evidence checks/update, graph work, output/certificate generation, post-state processing, evidence copy, digest, leader signing and pending state. |
+| Follower verification | Production certificate verification versus complete graph materialization, SCC/maximal safe output/deterministic order recomputation and checks of the **supplied** proof using graph edges. | Production `verifyCandidate` versus a test-only wrapper retaining context, digest/signature checks, evidence validation/update, state copies, pre/post IDs, finalization and pending state. |
+
+Full incremental construction includes **both** production graph copies. The
+rebuild constructor does not collect unneeded graph touches, so its Full ratio
+includes that difference; Core isolates graph maintenance. Both constructors
+retain the same post-state/post-manager copying sequence. A rebuild stores
+nonzero weight entries; the incremental cache can also contain explicit zeros.
+Both cache sizes are reported; no artificial padding is added for map equality.
+
+The recompute verifier generates no new proof and does not call the entire
+production certificate verifier after recomputation. Exact recomputed batches
+establish safety, maximality and order; graph-based tree/forest checks still
+reject a bad certificate attached to a correct output. Temporary follower graphs
+are discarded, not copied or persisted during finalization. Test-only proof
+checks/wrappers mirror their production counterparts; retain differential tests
+when those production functions change.
+
+Every iteration starts from the same immutable committed snapshot and clears
+`pending` outside timing, avoiding duplicate-candidate fast returns. Full calls
+perform their actual state/cache copies **inside** timing. Core setup copies,
+fixture generation, assertions, disk I/O, network, collector waits and hosting
+commit installation are excluded. Required algorithm allocations are included.
+Untimed setup allocations may still affect GC/cache conditions; no per-branch
+forced GC is used. Core and Full ratios must be reported separately.
+
+The output includes `ns/op`, `B/op`, `allocs/op` and per-sample counts: before and
+after-evidence Live/Done, classifications, positions/max positions, nonzero
+weights, nodes/edges, SCC count/max/nontrivial count, new effective positions,
+new Live, LO occurrences, touched pairs, output batches/transactions, tree edges,
+forest records and the two graph-cache weight counts. Structural counts are
+sample metadata, not rates or per-iteration accumulated counts.
+
+### Development and collection
+
+From the repository root (quote comma-containing arguments in PowerShell):
+
+```text
+go test ./... -count=1
+python -m unittest discover -s benchmark -p test_run_ablations.py
+go test ./pkg/ofo -run '^$' -bench '^BenchmarkAblation' -benchmem -benchtime=1x -count=1 -cpu=1 '-ablation-nodes=10,50' -ablation-seeds=1 -ablation-history=30
+```
+
+`1x` is only a smoke test. For formal collection use one otherwise idle
+**m5.xlarge**, matching the main experiment's Go version. No concurrent benchmark,
+stage logging, race instrumentation or profiling. The following standard-library
+Python script runs correctness checks, compiles the test binary once, then
+executes four independent processes sequentially with branch order AB/BA/AB/BA:
+
+```text
+python3 benchmark/run_ablations.py --nodes 10,50 --faults 1 --gamma 0.9 --seeds 1,7,19 --history 480 --runs 4 --benchtime 10x --instance-type m5.xlarge --region YOUR_REGION
+```
+
+Use the main experiment's final `f/gamma` in that command. Each process covers
+both experiments, Core/Full and every sample. Normally use 3-5 processes; more
+iterations improve within-sample precision but do not replace distinct seeds or
+processes. The command only uses the current machine; it creates no AWS resource.
+Instance type/region are operator-supplied metadata, not independently detected.
+
+The runner explicitly sets `GOMAXPROCS=1` and `-test.cpu=1`. This is a single-P
+microbenchmark setting, not CPU affinity and not the main program's default
+parallelism. Its absolute times must not be presented as distributed latency.
+
+Outputs go to a new `benchmark/results/ablation-TIMESTAMP` directory (or a new
+directory supplied with `--output`):
+
+- `metadata.json`: commit, dirty status, Go version/target, CPU/OS, GC settings,
+  GOMAXPROCS, parameters and exact commands. Commit the code before formal data
+  collection; retain development runs separately.
+- `correctness.log`, `build.log`, `run-*-AB/BA.log`: complete raw records.
+- `measurements.json`: all branch measurements and structural metrics.
+- `pairs.csv`: same-process/same-seed ratios (`Rebuild/Incremental` or
+  `Recompute/Certificate`), absolute times and allocations. Missing, duplicate or
+  structurally mismatched branch pairs fail collection.
+- `summary.csv`: per-seed medians and min/max **paired** speedup across processes;
+  seed variation is kept separate from repeated measurement variation. These
+  ranges are not confidence intervals. The compiled test binary is also retained.
+
+Report results as sorting construction/verification microbenchmark gains on the
+same hardware. A verification speedup does not imply an equal finalized-TPS gain;
+the distributed main experiment measures that conversion.
