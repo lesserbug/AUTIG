@@ -82,5 +82,22 @@ class OfferedRateResultTests(unittest.TestCase):
             self.write_result()
 
 
+class DiagnosticMetadataTests(unittest.TestCase):
+    def test_build_identity_is_from_binary_log_and_unknown_is_explicit(self):
+        self.assertEqual(fabfile._parse_build("old log")["git_commit"], None)
+        result = fabfile._parse_build("BENCHMARK BUILD revision=abc123 modified=true go=go1.22.12")
+        self.assertEqual(result, {"git_commit": "abc123", "git_modified": True, "go_version": "go1.22.12"})
+        self.assertIsNone(fabfile._parse_build("BENCHMARK BUILD revision=unknown modified=unknown go=go1.24.5")["git_modified"])
+
+    def test_diagnostics_are_opt_in(self):
+        parameters = dict(faults=1, gamma=.9, lo_interval=150, lo_size=200, rate=500, tx_size=512, duration=60)
+        command = fabfile._command(parameters, [0], binary="autig")
+        self.assertNotIn("-stage-timing", command)
+        self.assertNotIn("-cpuprofile", command)
+        parameters.update(stage_timing=True, cpuprofile=True)
+        enabled = fabfile._command(parameters, [0], binary="autig")
+        self.assertEqual(enabled, command + ["-stage-timing", "-cpuprofile"])
+
+
 if __name__ == "__main__":
     unittest.main()

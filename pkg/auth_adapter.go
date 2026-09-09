@@ -1,6 +1,7 @@
 package main
 
 import (
+	"SpeedFair_simplify/pkg/diagnostics"
 	"SpeedFair_simplify/pkg/network"
 	"SpeedFair_simplify/pkg/ofo"
 	"SpeedFair_simplify/pkg/types"
@@ -351,11 +352,14 @@ type benchmarkHostingAdapter struct {
 }
 
 func (adapter *benchmarkHostingAdapter) Propose(ctx context.Context, fragment *types.VerifiableFairOrderFragment, digest [32]byte) {
+	span := diagnostics.Start("hosting", adapter.leaderID, fragment.FragmentSeq)
+	defer span.Finish()
 	<-adapter.ready
 	defer adapter.leader.AbandonPending(digest)
 	if ctx.Err() != nil {
 		return
 	}
+	span.Mark("broadcast_start")
 	for replicaID := uint64(0); replicaID < adapter.replicaCount; replicaID++ {
 		if replicaID == adapter.leaderID {
 			continue
@@ -366,6 +370,7 @@ func (adapter *benchmarkHostingAdapter) Propose(ctx context.Context, fragment *t
 		}
 	}
 	accepted := map[uint64]bool{adapter.leaderID: true}
+	span.Mark("broadcast_end")
 	for uint64(len(accepted)) < adapter.replicaCount-adapter.faultCount {
 		select {
 		case message := <-adapter.verified:
@@ -385,9 +390,11 @@ func (adapter *benchmarkHostingAdapter) Propose(ctx context.Context, fragment *t
 	if ctx.Err() != nil {
 		return
 	}
+	span.Mark("quorum_reached")
 	if _, ok := adapter.leader.CommitPending(digest); !ok {
 		return
 	}
+	span.Mark("leader_committed")
 	for replicaID := uint64(0); replicaID < adapter.replicaCount; replicaID++ {
 		if replicaID == adapter.leaderID {
 			continue
@@ -396,4 +403,5 @@ func (adapter *benchmarkHostingAdapter) Propose(ctx context.Context, fragment *t
 			log.Printf("BENCHMARK LOCAL SEND FAILURE: BenchmarkAUTIGCommit to replica %d", replicaID)
 		}
 	}
+	span.Mark("commit_fanout_end")
 }

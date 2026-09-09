@@ -1,6 +1,7 @@
 package main
 
 import (
+	"SpeedFair_simplify/pkg/diagnostics"
 	"SpeedFair_simplify/pkg/network"
 	ofo "SpeedFair_simplify/pkg/ofo"
 	"SpeedFair_simplify/pkg/types"
@@ -15,6 +16,7 @@ import (
 	"math/rand"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"runtime/pprof"
 	"strconv"
 	"strings"
@@ -48,11 +50,12 @@ const (
 func main() {
 	// --- 1. 添加新的命令行标志，并使用常量作为默认值 ---
 	var (
-		configFile = flag.String("config", "config.json", "JSON config file for node addresses")
-		nodeList   = flag.String("nodes", "", "Comma-separated list of node IDs to run on this instance")
-		cpuProfile = flag.Bool("cpuprofile", false, "Enable CPU profiling for this instance")
-		faultCount = flag.Uint64("f", 2, "Number of tolerated faulty replicas")
-		gamma      = flag.Float64("gamma", 0.90, "Fairness parameter gamma")
+		configFile  = flag.String("config", "config.json", "JSON config file for node addresses")
+		nodeList    = flag.String("nodes", "", "Comma-separated list of node IDs to run on this instance")
+		cpuProfile  = flag.Bool("cpuprofile", false, "Enable CPU profiling for this instance")
+		stageTiming = flag.Bool("stage-timing", false, "Log per-fragment benchmark stage timing")
+		faultCount  = flag.Uint64("f", 2, "Number of tolerated faulty replicas")
+		gamma       = flag.Float64("gamma", 0.90, "Fairness parameter gamma")
 
 		// <<< 新增的标志，用于控制批次大小 >>>
 		loInterval  = flag.Int("lo-interval", LO_GENERATION_INTERVAL_MS_DEFAULT, "Interval in milliseconds for generating local orders")
@@ -62,16 +65,35 @@ func main() {
 		simDuration = flag.Int("sim-duration", SIMULATION_DURATION_SEC_DEFAULT, "Simulation duration in seconds")
 	)
 	flag.Parse()
+	diagnostics.Enable(*stageTiming)
+	revision, modified, goVersion := "unknown", "unknown", "unknown"
+	if info, ok := debug.ReadBuildInfo(); ok {
+		goVersion = info.GoVersion
+		for _, setting := range info.Settings {
+			switch setting.Key {
+			case "vcs.revision":
+				revision = setting.Value
+			case "vcs.modified":
+				modified = setting.Value
+			}
+		}
+	}
+	log.Printf("BENCHMARK BUILD revision=%s modified=%s go=%s", revision, modified, goVersion)
+	log.Printf("BENCHMARK DIAGNOSTICS stage_timing=%t cpu_profile=%t", *stageTiming, *cpuProfile)
 	if *txSize < 16 {
 		log.Fatal("Transaction size must be at least 16 bytes.")
 	}
 
 	if *cpuProfile {
-		f, _ := os.Create(fmt.Sprintf("cpu_profile_nodes_%s.pprof", strings.Replace(*nodeList, ",", "_", -1)))
-		if f != nil {
-			pprof.StartCPUProfile(f)
-			defer pprof.StopCPUProfile()
+		f, err := os.Create(fmt.Sprintf("cpu_profile_nodes_%s.pprof", strings.Replace(*nodeList, ",", "_", -1)))
+		if err != nil {
+			log.Fatalf("Create CPU profile: %v", err)
 		}
+		defer f.Close()
+		if err := pprof.StartCPUProfile(f); err != nil {
+			log.Fatalf("Start CPU profile: %v", err)
+		}
+		defer pprof.StopCPUProfile()
 	}
 
 	// 从配置文件读取节点信息

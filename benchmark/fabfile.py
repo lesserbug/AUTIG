@@ -104,7 +104,7 @@ def _prepare_runtime(nodes, addresses):
 def _command(parameters, node_ids, config="config.json", binary=None):
     binary = str(binary or _binary("autig"))
     ids = ",".join(str(i) for i in node_ids)
-    return [
+    command = [
         binary,
         "-config", config,
         "-nodes", ids,
@@ -116,6 +116,11 @@ def _command(parameters, node_ids, config="config.json", binary=None):
         "-tx-size", str(parameters["tx_size"]),
         "-sim-duration", str(parameters["duration"]),
     ]
+    if parameters.get("stage_timing", False):
+        command.append("-stage-timing")
+    if parameters.get("cpuprofile", False):
+        command.append("-cpuprofile")
+    return command
 
 
 def _duration_ms(value):
@@ -126,6 +131,18 @@ def _duration_ms(value):
     if parts and "".join(number + unit for number, unit in parts) == value:
         return sum(float(number) * units[unit] for number, unit in parts)
     raise RuntimeError(f"unknown Go duration {value!r}")
+
+
+def _parse_build(text):
+    match = re.search(r"BENCHMARK BUILD revision=(\S+) modified=(\S+) go=(\S+)", text)
+    if match is None:
+        return {"git_commit": None, "git_modified": None, "go_version": None}
+    revision, modified, version = match.groups()
+    return {
+        "git_commit": None if revision == "unknown" else revision,
+        "git_modified": {"true": True, "false": False}.get(modified),
+        "go_version": None if version == "unknown" else version,
+    }
 
 
 def _parse_log(path):
@@ -149,6 +166,7 @@ def _parse_log(path):
     if missing:
         raise RuntimeError(f"{path} is missing final metrics: {', '.join(missing)}")
     metrics = {
+        **_parse_build(text),
         "measurement_duration_ms": _duration_ms(matches["measurement_duration"].group(1)),
         "submitted": int(matches["submitted"].group(1)),
         "finalized": int(matches["finalized"].group(1)),
@@ -251,6 +269,9 @@ def _aws_records(settings, states=("running",)):
                         "id": instance["InstanceId"],
                         "public": instance.get("PublicIpAddress"),
                         "private": instance.get("PrivateIpAddress"),
+                        "availability_zone": instance.get("Placement", {}).get("AvailabilityZone"),
+                        "instance_type": instance.get("InstanceType"),
+                        "vpc_id": instance.get("VpcId"),
                     }
                 )
     records.sort(key=lambda record: (record["region"], record["id"]))
@@ -409,6 +430,11 @@ def _run_remote_once(records, settings, parameters, run):
             f"-run{run}-node{replica_id}.log"
         )
         connection.get(f"{name}/.benchmark/node.log", local=str(local))
+        if parameters.get("cpuprofile", False) and exited:
+            connection.get(
+                f"{name}/.benchmark/cpu_profile_nodes_{replica_id}.pprof",
+                local=str(local.with_suffix(".cpu.pprof")),
+            )
 
     _parallel(records, download)
     if not finished or not exited:
@@ -425,6 +451,9 @@ def _run_remote_once(records, settings, parameters, run):
         f"remote-n{parameters['nodes']}-r{parameters['rate']}-run{run}-node0.log"
     )
     metrics = _parse_log(leader_log)
+    metrics["ip_mode"] = "public"  # Actual transport configuration below.
+    metrics["replica_builds"] = {}
+    metrics["replica_instances"] = {str(i): record for i, record in enumerate(records)}
     metrics["locally_failed_local_order_send_attempts"] = 0
     metrics["locally_failed_autig_candidate_send_attempts"] = 0
     metrics["locally_failed_benchmark_commit_send_attempts"] = 0
@@ -434,6 +463,7 @@ def _run_remote_once(records, settings, parameters, run):
             f"-run{run}-node{replica_id}.log"
         )
         text = path.read_text(encoding="utf-8", errors="replace")
+        metrics["replica_builds"][str(replica_id)] = _parse_build(text)
         if any(marker in text for marker in ("Verification FAILED", "BENCHMARK INVALID", "Order leader rejected", "panic:")):
             raise RuntimeError(f"{path} reports a failed benchmark")
         metrics["replica_states"].update({
@@ -461,6 +491,8 @@ def local(ctx):
         "lo_size": 200,
         "duration": 20,
         "offered_rate_tolerance": 0.02,
+        "stage_timing": False,
+        "cpuprofile": False,
     }
     _validate_parameters(parameters)
     settings = _settings()
@@ -497,6 +529,8 @@ def remote(ctx):
         "duration": 60,
         "runs": 1,
         "offered_rate_tolerance": 0.02,
+        "stage_timing": False,
+        "cpuprofile": False,
     }
     settings = _settings()
     _require_repo(settings)
@@ -525,6 +559,8 @@ def remote(ctx):
                 "lo_size": matrix["lo_size"],
                 "duration": matrix["duration"],
                 "offered_rate_tolerance": matrix["offered_rate_tolerance"],
+                "stage_timing": matrix["stage_timing"],
+                "cpuprofile": matrix["cpuprofile"],
             }
             _validate_parameters(parameters)
             for run in range(1, matrix["runs"] + 1):

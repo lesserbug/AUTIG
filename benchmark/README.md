@@ -125,3 +125,70 @@ Regression checks (controller dependencies must be installed for Python):
 go test ./...
 python -m unittest discover -s benchmark -p 'test_*.py'
 ```
+
+The first evidence optimization preserves the validated append-only positions:
+it enumerates new/old and new/new pairs once, instead of visiting old/old pairs.
+Followers execute the same authentication, admission, weight and visibility
+updates but skip the graph-refresh pair set. Changed nodes are still tracked
+internally to update Solid/Shaded/Blank state. Quorums, certificate checks,
+snapshots, the single network worker and fragment sequencing are unchanged.
+
+The pre-optimization reference is commit
+`edf39655853139d77e6e405c3ba705b1b1d2fb66` (local tag
+`perf-baseline-before-pair-opt`). A frozen test-only evidence implementation
+supports differential state/output tests and a repeatable local microbenchmark:
+
+```bash
+go test ./pkg/ofo -run TestEvidenceOptimizationMatchesReference
+go test ./pkg/ofo -run '^$' -bench BenchmarkEvidenceEnumeration -benchtime=3x
+```
+
+For one diagnostic run, set `stage_timing: True` in the `local` parameters or
+`remote` matrix in `fabfile.py`. Set `cpuprofile: True` to collect CPU profiles.
+Both default to false; the equivalent Go flags are `-stage-timing` and
+`-cpuprofile`. Avoid mixing profiled and unprofiled results in a performance
+comparison. Remote profiles are downloaded alongside node logs as
+`remote-nN-rR-runK-nodeI.cpu.pprof`; local profiles remain in `.runtime` as
+`cpu_profile_nodes_0_1_2_3_4.pprof` for a five-node run. The existing download
+step retrieves profiles only after all processes have exited and flushed them.
+
+Stage records are JSON lines prefixed with `BENCHMARK STAGE`. Events are:
+
+- `collection_since_first_order`: first eligible LO to a complete evidence
+  batch. It excludes time before that first LO and is not the whole round time.
+- `construct`: lock acquisition, committed-state/manager clones, evidence,
+  graph refresh, proposal, post-state clones/finalization and signing.
+- `verify`: handler entry, lock acquisition, state clone, evidence replay,
+  certificate verification and post-state clone/finalization.
+- `hosting`: broadcast start/end, observed verification quorum, leader commit
+  and commit fanout completion.
+
+All `*_us` marks are offsets from that record's start, measured with Go's local
+monotonic clock. Subtract adjacent marks for stage durations. For example,
+`evidence_applied_us - manager_cloned_us` is leader evidence time;
+`quorum_reached_us - broadcast_end_us` is the remaining acknowledgement wait
+after broadcast, not the full follower verification time. Do not add follower
+verification to broadcast time: they overlap. `start_unix_ns` aids correlation,
+but subtracting timestamps across machines requires clock synchronization.
+Partial/failed operations can omit later marks. Only records with `accepted`
+true completed construction/verification; this does not mean hosting commit.
+
+Construction/verification records include pre-finalization Live/active counts,
+weight count, mean/max positions, receipt queue length and cumulative local
+fresh/retransmit counters. These counters describe generated/retransmitted LO
+attempts, not successful delivery or globally unique fresh transactions.
+Construction records also include evidence ID occurrences, output transaction
+count and certificate SCC/tree/block counts. These are structural sizes, not
+Gob wire byte counts. Network queue delay/length and wire serialization size
+are deliberately not instrumented in this first change; verification starts
+when the existing single message worker invokes the verifier.
+
+Every binary now logs its embedded Go build revision, dirty status and Go
+version. Results preserve them as `git_commit`, `git_modified`, `go_version`;
+old logs or builds lacking VCS metadata use null, never the controller's SHA.
+Remote results also record `replica_builds`, actual instance type, region/AZ,
+VPC and addresses under `replica_instances`, plus the current `ip_mode=public`.
+This change records the existing network placement; it does not switch routes
+or choose a different AZ. Reject mixed/unknown/dirty deployments when selecting
+formal comparison data, and rerun all node counts on the same committed build.
+These diagnostic fields do not change throughput, latency or tolerance rules.

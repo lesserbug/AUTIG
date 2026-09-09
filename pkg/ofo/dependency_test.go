@@ -17,7 +17,7 @@ type testAuthenticator struct {
 	leaderPrivate ed25519.PrivateKey
 }
 
-func newTestAuthenticator(t *testing.T, replicas uint64) *testAuthenticator {
+func newTestAuthenticator(t testing.TB, replicas uint64) *testAuthenticator {
 	t.Helper()
 	auth := &testAuthenticator{public: make(map[uint64]ed25519.PublicKey), private: make(map[uint64]ed25519.PrivateKey)}
 	for replicaID := uint64(0); replicaID < replicas; replicaID++ {
@@ -85,7 +85,7 @@ func testTx(t *testing.T, admission *testAdmission, value byte) types.TxID {
 	return id
 }
 
-func signedOrder(t *testing.T, auth types.Authenticator, state *EvidenceState, replicaID, fragmentSeq uint64, ids ...types.TxID) *types.LocalOrder {
+func signedOrder(t testing.TB, auth types.Authenticator, state *EvidenceState, replicaID, fragmentSeq uint64, ids ...types.TxID) *types.LocalOrder {
 	t.Helper()
 	order := &types.LocalOrder{
 		ReplicaID: replicaID, Epoch: state.Epoch, FragmentSeq: fragmentSeq,

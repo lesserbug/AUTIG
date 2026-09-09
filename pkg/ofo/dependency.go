@@ -153,6 +153,11 @@ func sortedSet(set map[types.TxID]bool) []types.TxID {
 }
 
 func applyEvidence(state *EvidenceState, orders []*types.LocalOrder, epoch, fragmentSeq, n, f uint64, gamma float64, maxOrderSize int, auth types.Authenticator, admission types.TransactionAdmission) (map[types.TxID]bool, map[pairKey]bool, error) {
+	return applyEvidenceWithTouches(state, orders, epoch, fragmentSeq, n, f, gamma, maxOrderSize, auth, admission, true)
+}
+
+// Followers need the same validated state, but not the graph-refresh pair set.
+func applyEvidenceWithTouches(state *EvidenceState, orders []*types.LocalOrder, epoch, fragmentSeq, n, f uint64, gamma float64, maxOrderSize int, auth types.Authenticator, admission types.TransactionAdmission, collectGraphTouches bool) (map[types.TxID]bool, map[pairKey]bool, error) {
 	if fragmentSeq != state.FragmentSeq+1 {
 		return nil, nil, fmt.Errorf("fragment sequence %d does not extend %d", fragmentSeq, state.FragmentSeq)
 	}
@@ -226,9 +231,20 @@ func applyEvidence(state *EvidenceState, orders []*types.LocalOrder, epoch, frag
 	state.StateID = types.PreStateIdentifier(epoch, fragmentSeq, state.StateID, types.EvidenceBatchDigest(orders))
 	state.Epoch = epoch
 	touchedNodes := make(map[types.TxID]bool)
-	touchedPairs := make(map[pairKey]bool)
+	var touchedPairs map[pairKey]bool
+	if collectGraphTouches {
+		touchedPairs = make(map[pairKey]bool)
+	}
 	for _, order := range orders {
-		newPositions := make(map[types.TxID]bool)
+		positions := state.Pos[order.ReplicaID]
+		var oldIDs []types.TxID
+		if len(order.OrderedTxs) > 0 {
+			oldIDs = make([]types.TxID, 0, len(positions))
+			for id := range positions {
+				oldIDs = append(oldIDs, id)
+			}
+		}
+		newIDs := make([]types.TxID, 0, len(order.OrderedTxs))
 		position := order.PrevPosition
 		for _, id := range order.OrderedTxs {
 			position++
@@ -240,28 +256,31 @@ func applyEvidence(state *EvidenceState, orders []*types.LocalOrder, epoch, frag
 				state.TxRef[id] = resolved[id]
 				state.states[id] = types.StateBlank
 			}
-			state.Pos[order.ReplicaID][id] = position
+			positions[id] = position
 			state.visibility[id]++
-			newPositions[id] = true
+			newIDs = append(newIDs, id)
 			touchedNodes[id] = true
 		}
 
-		positioned := make([]types.TxID, 0, len(state.Pos[order.ReplicaID]))
-		for id := range state.Pos[order.ReplicaID] {
-			positioned = append(positioned, id)
-		}
-		for i := 0; i < len(positioned); i++ {
-			for j := i + 1; j < len(positioned); j++ {
-				u, v := positioned[i], positioned[j]
-				if !newPositions[u] && !newPositions[v] {
-					continue
-				}
-				if state.Pos[order.ReplicaID][u] < state.Pos[order.ReplicaID][v] {
-					state.weights[edgeKey{u, v}]++
-				} else {
-					state.weights[edgeKey{v, u}]++
-				}
+		// Each new-old and new-new pair contributes exactly once. Old-old
+		// pairs already contributed in prior extensions and are never scanned.
+		// Keep the original position comparison for the direction of each pair.
+		addPair := func(u, v types.TxID) {
+			if positions[u] < positions[v] {
+				state.weights[edgeKey{u, v}]++
+			} else {
+				state.weights[edgeKey{v, u}]++
+			}
+			if collectGraphTouches {
 				touchedPairs[makePair(u, v)] = true
+			}
+		}
+		for i, id := range newIDs {
+			for _, old := range oldIDs {
+				addPair(old, id)
+			}
+			for _, later := range newIDs[i+1:] {
+				addPair(id, later)
 			}
 		}
 		state.Seq[order.ReplicaID] = order.NewPosition
@@ -279,7 +298,7 @@ func applyEvidence(state *EvidenceState, orders []*types.LocalOrder, epoch, frag
 			newState = types.StateShaded
 		}
 		state.states[id] = newState
-		if oldState == types.StateBlank && newState != types.StateBlank {
+		if collectGraphTouches && oldState == types.StateBlank && newState != types.StateBlank {
 			for other := range state.Live {
 				if other != id {
 					touchedPairs[makePair(id, other)] = true

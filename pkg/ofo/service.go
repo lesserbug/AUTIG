@@ -1,6 +1,7 @@
 package ofo
 
 import (
+	"SpeedFair_simplify/pkg/diagnostics"
 	"SpeedFair_simplify/pkg/network"
 	"SpeedFair_simplify/pkg/types"
 	"context"
@@ -46,10 +47,12 @@ type OFOService struct {
 	// Only the leader persists the active graph materialization.
 	UtigManager *DependencyManager
 
-	receiptQueue      []types.TxID
-	observed          map[types.TxID]bool
-	localOrderPending *types.LocalOrder
-	txSubmissionTimes map[types.TxID]time.Time
+	receiptQueue          []types.TxID
+	observed              map[types.TxID]bool
+	localOrderPending     *types.LocalOrder
+	localOrderFresh       uint64
+	localOrderRetransmits uint64
+	txSubmissionTimes     map[types.TxID]time.Time
 
 	pipelineCtx        context.Context
 	pipelineCancel     context.CancelFunc
@@ -172,6 +175,7 @@ func cloneLocalOrder(order *types.LocalOrder) *types.LocalOrder {
 func (s *OFOService) GenerateAndSendLocalOrder() {
 	s.rwMu.Lock()
 	if s.localOrderPending != nil {
+		s.localOrderRetransmits++
 		order := cloneLocalOrder(s.localOrderPending)
 		if order.FragmentSeq != s.committed.FragmentSeq+1 || order.Epoch != s.authContext.Epoch {
 			order.FragmentSeq = s.committed.FragmentSeq + 1
@@ -213,6 +217,7 @@ func (s *OFOService) GenerateAndSendLocalOrder() {
 	}
 	order.Signature = signature
 	s.localOrderPending = cloneLocalOrder(order)
+	s.localOrderFresh++
 	s.rwMu.Unlock()
 	s.sendLocalOrder(order)
 }
@@ -228,6 +233,8 @@ func (s *OFOService) runCollectorStage() {
 	defer close(s.batchReadyChan)
 	requiredOrders := s.replicaCount - s.fFaulty
 	var pending []*types.LocalOrder
+	var collection *diagnostics.Span
+	defer func() { collection.Finish() }()
 	receivedFrom := make(map[uint64]bool)
 	timeout := 200 * time.Millisecond
 	if s.loInterval != nil {
@@ -243,6 +250,10 @@ func (s *OFOService) runCollectorStage() {
 			return
 		}
 		batch := pending
+		collection.Set("evidence_senders", len(batch))
+		collection.Set("complete", true)
+		collection.Finish()
+		collection = nil
 		pending = nil
 		receivedFrom = make(map[uint64]bool)
 		select {
@@ -275,6 +286,7 @@ func (s *OFOService) runCollectorStage() {
 				continue
 			}
 			if len(pending) == 0 {
+				collection = diagnostics.Start("collection_since_first_order", s.ReplicaID, expectedFragmentSeq)
 				timer.Reset(timeout)
 			}
 			if !receivedFrom[order.ReplicaID] {
@@ -335,28 +347,39 @@ func (s *OFOService) runProposerStage() {
 }
 
 func (s *OFOService) constructCandidate(orders []*types.LocalOrder) (*pendingCandidate, error) {
+	span := diagnostics.Start("construct", s.ReplicaID, 0)
+	defer span.Finish()
 	s.rwMu.Lock()
 	defer s.rwMu.Unlock()
+	span.Mark("lock_acquired")
+	span.Set("fragment_seq", s.committed.FragmentSeq+1)
 	if s.pending != nil {
 		return nil, fmt.Errorf("a candidate is already pending")
 	}
 	orders = append([]*types.LocalOrder(nil), orders...)
 	sort.Slice(orders, func(i, j int) bool { return orders[i].ReplicaID < orders[j].ReplicaID })
 	preState := s.committed.clone()
+	span.Mark("state_cloned")
 	manager := s.UtigManager.clone()
+	span.Mark("manager_cloned")
 	fragmentSeq := s.committed.FragmentSeq + 1
 	touchedNodes, touchedPairs, err := applyEvidence(preState, orders, s.authContext.Epoch, fragmentSeq, s.replicaCount, s.fFaulty, s.gamma, s.loMaxSize, s.auth, s.admission)
 	if err != nil {
 		return nil, err
 	}
+	span.Mark("evidence_applied")
 	manager.refresh(preState, touchedNodes, touchedPairs)
+	span.Mark("graph_refreshed")
 	finalOrder, certificate, err := manager.buildProposal(preState)
 	if err != nil {
 		return nil, err
 	}
+	span.Mark("proposal_built")
 	postState := preState.clone()
 	postManager := manager.clone()
+	span.Mark("post_cloned")
 	finalize(postState, postManager, finalOrder, certificate.Part)
+	span.Mark("finalized")
 	fragment := &types.VerifiableFairOrderFragment{
 		Epoch: s.authContext.Epoch, AuthContextID: s.authContext.Identifier, LeaderID: s.authContext.LeaderID,
 		FragmentSeq: fragmentSeq, PreviousStateID: s.committed.StateID,
@@ -370,6 +393,27 @@ func (s *OFOService) constructCandidate(orders []*types.LocalOrder) (*pendingCan
 		return nil, fmt.Errorf("sign fragment: %w", err)
 	}
 	fragment.LeaderSignature = signature
+	span.Mark("signed")
+	s.recordStageState(span, preState)
+	if span != nil {
+		occurrences, output, trees := 0, 0, 0
+		for _, order := range orders {
+			occurrences += len(order.OrderedTxs)
+		}
+		for _, batch := range finalOrder.Batches {
+			output += len(batch.Transactions)
+		}
+		for _, claim := range certificate.Part {
+			trees += len(claim.InTree) + len(claim.OutTree)
+		}
+		span.Set("evidence_senders", len(orders))
+		span.Set("evidence_id_occurrences", occurrences)
+		span.Set("output_transactions", output)
+		span.Set("certificate_tree_edges", trees)
+		span.Set("certificate_sccs", len(certificate.Part))
+		span.Set("certificate_block_records", len(certificate.BlockForest))
+		span.Set("accepted", true)
+	}
 	candidate := &pendingCandidate{digest: digest, preState: preState, postState: postState, manager: postManager, fragment: fragment, done: make(chan struct{})}
 	s.pending = candidate
 	return candidate, nil
@@ -384,8 +428,11 @@ func cloneOrders(orders []*types.LocalOrder) []*types.LocalOrder {
 }
 
 func (s *OFOService) verifyCandidate(fragment *types.VerifiableFairOrderFragment, sender uint64) bool {
+	span := diagnostics.Start("verify", s.ReplicaID, fragment.FragmentSeq)
+	defer span.Finish()
 	s.rwMu.Lock()
 	defer s.rwMu.Unlock()
+	span.Mark("lock_acquired")
 	digest := types.FragmentDigest(fragment)
 	if sender != s.authContext.LeaderID || fragment.LeaderID != s.authContext.LeaderID || fragment.Epoch != s.authContext.Epoch || fragment.AuthContextID != s.authContext.Identifier {
 		return false
@@ -400,9 +447,11 @@ func (s *OFOService) verifyCandidate(fragment *types.VerifiableFairOrderFragment
 		return s.pending.digest == digest
 	}
 	preState := s.committed.clone()
-	if _, _, err := applyEvidence(preState, fragment.Evidence, fragment.Epoch, fragment.FragmentSeq, s.replicaCount, s.fFaulty, s.gamma, s.loMaxSize, s.auth, s.admission); err != nil {
+	span.Mark("state_cloned")
+	if _, _, err := applyEvidenceWithTouches(preState, fragment.Evidence, fragment.Epoch, fragment.FragmentSeq, s.replicaCount, s.fFaulty, s.gamma, s.loMaxSize, s.auth, s.admission, false); err != nil {
 		return false
 	}
+	span.Mark("evidence_applied")
 	if preState.StateID != fragment.CandidateEvidenceStateID {
 		return false
 	}
@@ -410,13 +459,45 @@ func (s *OFOService) verifyCandidate(fragment *types.VerifiableFairOrderFragment
 		log.Printf("Replica %d rejected structural certificate: %v", s.ReplicaID, err)
 		return false
 	}
+	span.Mark("certificate_verified")
 	postState := preState.clone()
+	span.Mark("post_cloned")
 	finalize(postState, NewDependencyManager(s.replicaCount, s.fFaulty, s.gamma), fragment.FinalOrder, fragment.Certificate.Part)
+	span.Mark("finalized")
 	if postState.StateID != fragment.CandidatePostStateID {
 		return false
 	}
 	s.pending = &pendingCandidate{digest: digest, preState: preState, postState: postState, fragment: fragment, done: make(chan struct{})}
+	s.recordStageState(span, preState)
+	span.Set("accepted", true)
 	return true
+}
+
+// Called with rwMu held. Counts are diagnostic only; no per-pair logging.
+func (s *OFOService) recordStageState(span *diagnostics.Span, state *EvidenceState) {
+	if span == nil {
+		return
+	}
+	total, maxPos, active := 0, 0, 0
+	for _, positions := range state.Pos {
+		total += len(positions)
+		if len(positions) > maxPos {
+			maxPos = len(positions)
+		}
+	}
+	for _, status := range state.states {
+		if status != types.StateBlank {
+			active++
+		}
+	}
+	span.Set("live", len(state.Live))
+	span.Set("active_nodes", active)
+	span.Set("weights", len(state.weights))
+	span.Set("positions_mean", float64(total)/float64(s.replicaCount))
+	span.Set("positions_max", maxPos)
+	span.Set("receipt_queue", len(s.receiptQueue))
+	span.Set("local_orders_fresh_total", s.localOrderFresh)
+	span.Set("local_orders_retransmitted_total", s.localOrderRetransmits)
 }
 
 // CommitPending is the only path that installs authoritative state. The hosting
