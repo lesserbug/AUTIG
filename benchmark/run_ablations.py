@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import statistics
 import subprocess
+import sys
 import time
 
 
@@ -88,8 +89,9 @@ def main():
     parser.add_argument("--gamma", type=float, default=.9)
     parser.add_argument("--seeds", default="1,7,19")
     parser.add_argument("--history", type=int, default=480)
+    parser.add_argument("--lo-size", type=int, default=200)
     parser.add_argument("--runs", type=int, default=4, help="Independent processes; normally 3-5")
-    parser.add_argument("--benchtime", default="10x")
+    parser.add_argument("--benchtime", default="1s", help="Timed work per leaf; use 1x only for smoke tests")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--instance-type", default="unrecorded")
     parser.add_argument("--region", default="unrecorded")
@@ -124,6 +126,7 @@ def main():
     # Test first, then compile once. Compilation and fixture preflight are never
     # counted in ns/op. Each run launches a fresh process from this same binary.
     execute(["go", "test", "./...", "-count=1"], output / "correctness.log")
+    execute([sys.executable, "-m", "unittest", "discover", "-s", "benchmark", "-p", "test_run_ablations.py"], output / "runner-tests.log")
     binary = output / ("ofo.test.exe" if os.name == "nt" else "ofo.test")
     execute(["go", "test", "-c", "-o", str(binary), "./pkg/ofo"], output / "build.log")
     all_pairs, raw = [], []
@@ -133,7 +136,7 @@ def main():
         command = [str(binary), "-test.run=^$", "-test.bench=^BenchmarkAblation",
                    "-test.benchmem", f"-test.benchtime={args.benchtime}", "-test.count=1", "-test.cpu=1",
                    f"-ablation-nodes={args.nodes}", f"-ablation-f={args.faults}", f"-ablation-gamma={args.gamma}",
-                   f"-ablation-seeds={args.seeds}", f"-ablation-history={args.history}", f"-ablation-order={order}"]
+                   f"-ablation-seeds={args.seeds}", f"-ablation-history={args.history}", f"-ablation-lo-size={args.lo_size}", f"-ablation-order={order}"]
         execute(command, log)
         rows = parse_benchmarks(log.read_text(encoding="utf-8"))
         raw.extend(dict(row, run=run, order=order) for row in rows)

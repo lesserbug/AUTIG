@@ -418,6 +418,7 @@ func checkAblationGraph(t testing.TB, x *ablationFixture) {
 	assertAblationState(t, updated, x.candidate.preState)
 	checkAblationPositionCaches(t, updated, s.replicaCount, s.fFaulty, s.gamma)
 	x.metrics["touched_pairs"] = float64(len(pairs))
+	x.metrics["touched_nodes"] = float64(len(nodes))
 	x.metrics["incremental_cache_weights"] = float64(len(incremental.weights))
 	x.metrics["rebuilt_cache_weights"] = float64(len(rebuilt.weights))
 	left, right := x.service(true), x.service(true)
@@ -457,7 +458,7 @@ func checkAblationGraph(t testing.TB, x *ablationFixture) {
 				ids = append(ids, id)
 			}
 		}
-		next = append(next, signedOrder(t, x.auth, left.committed, r, left.committed.FragmentSeq+1, ids...))
+		next = append(next, signedOrder(t, x.auth, left.committed, r, left.committed.FragmentSeq+1, ids[:min(len(ids), s.loMaxSize)]...))
 	}
 	a, err = left.constructCandidate(next)
 	if err != nil {
@@ -578,4 +579,30 @@ func TestAblationFixtureReproducible(t *testing.T) {
 	}
 	assertAblationState(t, a.base.committed, b.base.committed)
 	assertAblationGraph(t, a.base.UtigManager, b.base.UtigManager)
+}
+
+func TestAblationBoundedLocalOrders(t *testing.T) {
+	for _, n := range []uint64{10, 50} {
+		for _, c := range ablationCases(30) {
+			c.fresh = min(c.fresh, 2)
+			c.loMaxSize = 16 // force multi-round history and partial cycle release
+			t.Run(fmt.Sprintf("n%d/%s", n, c.name), func(t *testing.T) {
+				x := makeAblationFixture(t, n, 1, .9, c, 7)
+				if x.metrics["warm_max_lo"] > 16 || x.metrics["max_lo"] > 16 || x.metrics["lo_max_size"] != 16 {
+					t.Fatal("fixture exceeded its declared LocalOrder cap")
+				}
+				if c.history > 16 && x.metrics["warm_rounds"] <= 3 {
+					t.Fatal("history was not accumulated across bounded rounds")
+				}
+				if c.cycle && c.release && (x.metrics["pre_solid"] == 0 || x.metrics["pre_shaded"] == 0) {
+					t.Fatal("partial release did not retain a mixed, blocked SCC")
+				}
+				checkAblationGraph(t, x)
+				checkAblationVerifier(t, x, x.candidate.fragment, 0, true)
+				if !c.release && c.fresh == 0 && (x.metrics["new_positions"] != 0 || x.metrics["touched_nodes"] != 0) {
+					t.Fatal("empty/delayed case has effective touches")
+				}
+			})
+		}
+	}
 }

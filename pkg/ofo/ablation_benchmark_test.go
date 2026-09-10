@@ -2,8 +2,10 @@ package ofo
 
 import (
 	"SpeedFair_simplify/pkg/diagnostics"
+	"SpeedFair_simplify/pkg/types"
 	"flag"
 	"fmt"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -16,10 +18,9 @@ var (
 	ablationGamma   = flag.Float64("ablation-gamma", .9, "Use the final main-experiment gamma")
 	ablationSeeds   = flag.String("ablation-seeds", "1,7,19", "Fixed sample seeds")
 	ablationHistory = flag.Int("ablation-history", 480, "Retained transactions in large synthetic cases (at least 6)")
+	ablationLOSize  = flag.Int("ablation-lo-size", 200, "Maximum transactions per signed LocalOrder, including warm-up")
 	ablationOrder   = flag.String("ablation-order", "AB", "Branch execution order: AB or BA")
 )
-
-var ablationSink any
 
 func ablationIntegers(t testing.TB, value string) []int64 {
 	t.Helper()
@@ -42,6 +43,9 @@ func benchmarkAblation(b *testing.B, graph bool) {
 	if *ablationHistory < 6 {
 		b.Fatal("ablation-history must be at least 6")
 	}
+	if *ablationLOSize < 3 {
+		b.Fatal("ablation-lo-size must be at least 3")
+	}
 	if *ablationOrder != "AB" && *ablationOrder != "BA" {
 		b.Fatal("ablation-order must be AB or BA")
 	}
@@ -50,6 +54,7 @@ func benchmarkAblation(b *testing.B, graph bool) {
 			b.Fatal("need at least two logical replicas")
 		}
 		for _, c := range ablationCases(*ablationHistory) {
+			c.loMaxSize = *ablationLOSize
 			for _, seed := range ablationIntegers(b, *ablationSeeds) {
 				name := fmt.Sprintf("n%d_f%d_g%g/%s/seed%d", n, *ablationFaults, *ablationGamma, c.name, seed)
 				b.Run(name, func(b *testing.B) {
@@ -89,13 +94,39 @@ func benchmarkAblation(b *testing.B, graph bool) {
 
 func benchmarkAblationBranch(b *testing.B, x *ablationFixture, graph, full, baseline bool) {
 	s := x.service(graph)
-	pre := x.base.committed.clone()
-	nodes, pairs, err := applyEvidence(pre, x.orders, s.authContext.Epoch, pre.FragmentSeq+1, s.replicaCount, s.fFaulty, s.gamma, s.loMaxSize, s.auth, s.admission)
-	if err != nil {
-		b.Fatal(err)
+	pre := x.candidate.preState
+	var nodes map[types.TxID]bool
+	var pairs map[pairKey]bool
+	// Only incremental Core needs a touch set. Full calls do their own evidence
+	// application; all other Core branches can read the validated fixture state.
+	if graph && !full && !baseline {
+		state := x.base.committed.clone()
+		var err error
+		nodes, pairs, err = applyEvidence(state, x.orders, s.authContext.Epoch, state.FragmentSeq+1, s.replicaCount, s.fFaulty, s.gamma, s.loMaxSize, s.auth, s.admission)
+		if err != nil {
+			b.Fatal(err)
+		}
 	}
 	f := x.candidate.fragment
+	defer func() {
+		for name, value := range x.metrics {
+			b.ReportMetric(value, name)
+		}
+	}()
 	b.ReportAllocs()
+	if graph && !full && !baseline && len(nodes) == 0 && len(pairs) == 0 {
+		// refresh cannot mutate anything with empty touches. No restoration is
+		// needed: avoid millions of unnecessary graph copies during time-based
+		// calibration of this very short Core operation.
+		manager := x.base.UtigManager
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			manager.refresh(pre, nodes, pairs)
+		}
+		b.StopTimer()
+		runtime.KeepAlive(manager)
+		return
+	}
 	b.ResetTimer()
 	b.StopTimer()
 	for i := 0; i < b.N; i++ {
@@ -145,12 +176,10 @@ func benchmarkAblationBranch(b *testing.B, x *ablationFixture, graph, full, base
 			}
 		}
 		b.StopTimer()
-		ablationSink = result
+		runtime.KeepAlive(result)
+		s.pending = nil
 		if opErr != nil || !accepted {
 			b.Fatalf("operation failed: accepted=%t err=%v", accepted, opErr)
 		}
-	}
-	for name, value := range x.metrics {
-		b.ReportMetric(value, name)
 	}
 }

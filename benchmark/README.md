@@ -223,10 +223,20 @@ store with copying and a no-op `ValidateAdmission`, like the standalone adapter.
 Full results therefore measure this implementation, not arbitrary business
 admission or full BFT consensus.
 
-Each fixture executes a nonempty bootstrap commit, a history round, and another
-committed round retaining that history. Every round uses the collector's rotating
+Each fixture executes a nonempty bootstrap commit, bounded history rounds, and
+another committed round retaining that history. Every round uses the collector's rotating
 `n-f` sender set, contiguous signed extensions, normal production construction,
 follower verification and `CommitPending`. No authoritative maps are fabricated.
+
+`-ablation-lo-size` (runner: `--lo-size`) explicitly sets the LocalOrder cap,
+default **200**, matching the current main benchmark. Every warm-up and measured
+extension obeys it; large history is accumulated over more rounds instead of
+silently increasing the cap. Cycle release adds one previously missing reporter:
+if necessary, it first commits bounded prefixes while the mixed Shaded/Solid SCC
+remains blocked, then releases the remaining suffix in the measured round.
+The final suffix plus fresh transactions fits one LO. Ordered release cases must
+fit one LO, since earlier prefixes could finalize and reduce the requested M.
+Invalid size/profile combinations fail rather than silently truncate workload.
 
 | Case | Purpose |
 | --- | --- |
@@ -236,7 +246,7 @@ follower verification and `CommitPending`. No authoritative maps are fabricated.
 | `synthetic-blocked-solid` | Three Shaded predecessors retain a large Solid history; 8 fresh transactions. |
 | `synthetic-empty-extension` | Signed empty extensions; no effective new positions. |
 | `synthetic-delayed-done` | The replica omitted from bootstrap reports those finalized transactions late; LO positions advance, effective positions do not. |
-| `synthetic-cycle-held` / `synthetic-cycle-release` | Three cyclic block reception orders form a large SCC; keep it blocked or add missing first positions and release it. |
+| `synthetic-cycle-held` / `synthetic-cycle-release` | Three cyclic block reception orders form an SCC containing all retained history; keep it blocked or finish one reporter's missing positions and release it. |
 
 Large history defaults to 480 transactions (`-ablation-history`). Fresh counts
 are unique new transactions, **not** new `(replica, transaction)` positions.
@@ -245,6 +255,20 @@ that have not assigned them first positions. The high-backlog/cycle cases are
 legal controlled synthetic sensitivity samples, not claims about workload
 frequency. They cannot attribute a particular AWS throughput change; that needs
 the run's stage logs or replayable inputs.
+
+There is no single fixed workload: M varies between the small/large cases, and
+the large cases vary fresh input between 0, 8 and 128. For a state-size curve,
+repeat collection with `--history 100`, `500`, `1000`, `2000`, holding the other
+parameters fixed. Compare like case names across runs using the actual `pre_live`
+metric; small cases intentionally stay fixed. Use `touched_nodes` if the paper's
+k denotes touched transactions, and `new_positions` for new effective positions.
+Neither is interchangeable with LO occurrences. A full Cartesian M/k sweep is
+optional; the default representative cases do not claim to be such a sweep.
+
+Fixture invariants require the full historical SCC before and after evidence,
+zero output for held cases, complete output for release cases, and real Shaded
+roots/excluded Solid vertices/nonempty forests for blocked cases. Forest depth
+and root counts are reported as obtained, not assumed to represent deep chains.
 
 Before any leaf benchmark timer starts, the exact sample passes graph, output,
 certificate, authoritative/cache state, commit and following-round checks, plus
@@ -287,15 +311,31 @@ Every iteration starts from the same immutable committed snapshot and clears
 perform their actual state/cache copies **inside** timing. Core setup copies,
 fixture generation, assertions, disk I/O, network, collector waits and hosting
 commit installation are excluded. Required algorithm allocations are included.
+Full leaves no longer perform an unused evidence replay in setup. Core uses the
+validated fixture state, deriving touches only for incremental Core. Results are
+kept alive locally through each operation, not retained in a global sink.
 Untimed setup allocations may still affect GC/cache conditions; no per-branch
 forced GC is used. Core and Full ratios must be reported separately.
+
+For empty touches, Core refresh cannot mutate the graph, so it reuses the same
+snapshot and times a continuous loop without per-iteration restore/pause calls.
+This avoids millions of unnecessary graph copies when a time-based benchtime
+calibrates the very short no-change operation. Full paths still include all
+production copies and reset pending, even with empty evidence extensions.
 
 The output includes `ns/op`, `B/op`, `allocs/op` and per-sample counts: before and
 after-evidence Live/Done, classifications, positions/max positions, nonzero
 weights, nodes/edges, SCC count/max/nontrivial count, new effective positions,
-new Live, LO occurrences, touched pairs, output batches/transactions, tree edges,
-forest records and the two graph-cache weight counts. Structural counts are
+new Live, LO occurrences, touched nodes/pairs, output batches/transactions, tree
+edges, excluded Solid count, forest records/roots/max depth, the LO cap and
+maximum observed warm-up/current LO sizes, warm-up rounds, and the two graph-cache
+weight counts. Structural counts are
 sample metadata, not rates or per-iteration accumulated counts.
+
+Describe `ns/op`, `B/op` and `allocs/op` as **execution time and cumulative
+allocation per replay**. `B/op` is allocated bytes, not peak resident memory or
+retained heap. Allocation counters come from `testing.B.ReportAllocs()`, not a
+one-off manual `runtime.MemStats` subtraction.
 
 ### Development and collection
 
@@ -307,14 +347,18 @@ python -m unittest discover -s benchmark -p test_run_ablations.py
 go test ./pkg/ofo -run '^$' -bench '^BenchmarkAblation' -benchmem -benchtime=1x -count=1 -cpu=1 '-ablation-nodes=10,50' -ablation-seeds=1 -ablation-history=30
 ```
 
-`1x` is only a smoke test. For formal collection use one otherwise idle
+`1x` is only a smoke test. The runner defaults to time-based `--benchtime 1s`
+instead of a small fixed `10x`; this is timed algorithm work per leaf, not total
+wall time including setup. Inspect between-process spread before reporting
+precise speedups; a time budget by itself does not guarantee statistical precision.
+For formal collection use one otherwise idle
 **m5.xlarge**, matching the main experiment's Go version. No concurrent benchmark,
 stage logging, race instrumentation or profiling. The following standard-library
 Python script runs correctness checks, compiles the test binary once, then
 executes four independent processes sequentially with branch order AB/BA/AB/BA:
 
 ```text
-python3 benchmark/run_ablations.py --nodes 10,50 --faults 1 --gamma 0.9 --seeds 1,7,19 --history 480 --runs 4 --benchtime 10x --instance-type m5.xlarge --region YOUR_REGION
+python3 benchmark/run_ablations.py --nodes 10,50 --faults 1 --gamma 0.9 --seeds 1,7,19 --history 480 --lo-size 200 --runs 4 --benchtime 1s --instance-type m5.xlarge --region YOUR_REGION
 ```
 
 Use the main experiment's final `f/gamma` in that command. Each process covers
@@ -333,7 +377,9 @@ directory supplied with `--output`):
 - `metadata.json`: commit, dirty status, Go version/target, CPU/OS, GC settings,
   GOMAXPROCS, parameters and exact commands. Commit the code before formal data
   collection; retain development runs separately.
-- `correctness.log`, `build.log`, `run-*-AB/BA.log`: complete raw records.
+- `correctness.log`, `runner-tests.log`, `build.log`, `run-*-AB/BA.log`: complete
+  raw records. Both Go correctness and Python parsing/pairing tests run before
+  collection.
 - `measurements.json`: all branch measurements and structural metrics.
 - `pairs.csv`: same-process/same-seed ratios (`Rebuild/Incremental` or
   `Recompute/Certificate`), absolute times and allocations. Missing, duplicate or

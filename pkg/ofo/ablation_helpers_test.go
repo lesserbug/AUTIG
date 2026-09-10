@@ -17,6 +17,7 @@ import (
 type ablationCase struct {
 	name           string
 	history, fresh int
+	loMaxSize      int // zero uses the main benchmark's current limit, 200
 	cycle, release bool
 	delayed        bool
 	blocked        bool
@@ -29,6 +30,7 @@ type ablationFixture struct {
 	auth      *testAuthenticator
 	admission *testAdmission
 	metrics   map[string]float64
+	warmMaxLO int
 }
 
 func ablationCases(history int) []ablationCase {
@@ -61,7 +63,14 @@ func makeAblationFixture(t testing.TB, n, f uint64, gamma float64, c ablationCas
 	x := &ablationFixture{auth: newAblationAuthenticator(n, seed), admission: newTestAdmission()}
 	context := types.AuthContext{Epoch: 1, LeaderID: 0, Identifier: [32]byte{7}}
 	genesis := types.ProtocolGenesis{StateID: [32]byte{1}, FragmentDigest: [32]byte{2}}
-	s, err := NewOFOService(0, n, f, gamma, newTestNetwork(), c.history+c.fresh+16, nil, false, x.auth, x.admission, context, genesis, func(*types.VerifiableFairOrderFragment, [32]byte) {})
+	limit := c.loMaxSize
+	if limit == 0 {
+		limit = 200
+	}
+	if limit < 3 || c.fresh > limit || (c.release && c.fresh >= limit) {
+		t.Fatalf("LO limit %d cannot accommodate this case's fresh extension (%d)", limit, c.fresh)
+	}
+	s, err := NewOFOService(0, n, f, gamma, newTestNetwork(), limit, nil, false, x.auth, x.admission, context, genesis, func(*types.VerifiableFairOrderFragment, [32]byte) {})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,26 +116,81 @@ func makeAblationFixture(t testing.TB, n, f uint64, gamma float64, c ablationCas
 		cut := (index % 3) * (len(history) / 3)
 		return append(append([]types.TxID(nil), history[cut:]...), history[:cut]...)
 	}
-	x.advanceRound(t, ordersFor(func(r uint64) []types.TxID {
+	// Drain each replica's prescribed reception sequence in bounded extensions.
+	// The rotating sender set may require extra rounds; never raise loMaxSize.
+	queued := make(map[uint64][]types.TxID)
+	for r := uint64(0); r < n; r++ {
 		if index, ok := reporters[r]; ok {
-			return historyOrder(index)
+			queued[r] = historyOrder(index)
+		} else if c.blocked {
+			queued[r] = history[3:]
 		}
-		if c.blocked {
-			return history[3:]
+	}
+	for len(queued) > 0 {
+		x.advanceRound(t, ordersFor(func(r uint64) []types.TxID {
+			ids := queued[r]
+			count := min(len(ids), limit)
+			if count == len(ids) {
+				delete(queued, r)
+			} else {
+				queued[r] = ids[count:]
+			}
+			return ids[:count]
+		}))
+	}
+	// A single additional reporter suffices to make the retained history Solid.
+	// For cycles, add the least represented rotation to preserve the large SCC.
+	var releaser uint64
+	var releaseTail []types.TxID
+	if c.release {
+		for {
+			if _, ok := reporters[releaser]; !ok {
+				break
+			}
+			releaser++
 		}
-		return nil
-	}))
+		releaseTail = historyOrder(len(reporters) % 3)
+		if !c.cycle && len(releaseTail)+c.fresh > limit {
+			t.Fatal("ordered release must fit one LO to retain all history until the sample")
+		}
+		for len(releaseTail)+c.fresh > limit {
+			x.advanceRound(t, ordersFor(func(r uint64) []types.TxID {
+				if r != releaser {
+					return nil
+				}
+				count := min(limit, len(releaseTail)-(limit-c.fresh))
+				ids := releaseTail[:count]
+				releaseTail = releaseTail[count:]
+				return ids
+			}))
+		}
+	}
 	// Retain the graph across another legally committed round, including when
 	// the maximal safe output is empty. No state maps are hand-populated.
 	x.advanceRound(t, ordersFor(func(uint64) []types.TxID { return nil }))
-	x.orders = ordersFor(func(r uint64) []types.TxID {
-		var ids []types.TxID
-		if c.release {
-			for _, id := range historyOrder(int(r)) {
-				if _, exists := s.committed.Pos[r][id]; !exists {
-					ids = append(ids, id)
+	// The final release/late-Done reporter must belong to the measured round.
+	if c.release || c.delayed {
+		required := releaser
+		if c.delayed {
+			required = 0
+		}
+		for {
+			selected := false
+			for _, r := range ablationSenders(n, f, s.committed.FragmentSeq+1) {
+				if r == required {
+					selected = true
 				}
 			}
+			if selected {
+				break
+			}
+			x.advanceRound(t, ordersFor(func(uint64) []types.TxID { return nil }))
+		}
+	}
+	x.orders = ordersFor(func(r uint64) []types.TxID {
+		var ids []types.TxID
+		if c.release && r == releaser {
+			ids = append(ids, releaseTail...)
 		}
 		ids = append(ids, fresh...)
 		if c.delayed {
@@ -146,14 +210,20 @@ func makeAblationFixture(t testing.TB, n, f uint64, gamma float64, c ablationCas
 	if len(s.committed.Live) != c.history {
 		t.Fatalf("retained history=%d, want %d", len(s.committed.Live), c.history)
 	}
-	if c.cycle && x.metrics["pre_nontrivial_scc"] == 0 {
-		t.Fatal("cycle fixture did not retain a nontrivial SCC")
+	if c.cycle && (x.metrics["pre_max_scc"] != float64(c.history) || x.metrics["updated_max_scc"] != float64(c.history)) {
+		t.Fatal("cycle fixture did not preserve its full historical SCC")
 	}
-	if c.release && x.metrics["output_tx"] == 0 {
-		t.Fatal("release fixture has no output")
+	if c.release && x.metrics["output_tx"] != float64(c.history+c.fresh) {
+		t.Fatal("release fixture did not output all history and fresh transactions")
 	}
-	if c.blocked && x.metrics["pre_solid"] == 0 {
-		t.Fatal("blocked fixture did not retain Solid history")
+	if !c.release && c.history > 0 && x.metrics["output_tx"] != 0 {
+		t.Fatal("held fixture unexpectedly released output")
+	}
+	if c.blocked && (x.metrics["pre_shaded"] != 3 || x.metrics["pre_solid"] != float64(c.history-3)) {
+		t.Fatal("blocked fixture lost its Shaded roots or retained Solid history")
+	}
+	if !c.release && c.history > 0 && (c.fresh > 0 || c.blocked) && (x.metrics["excluded_solid"] == 0 || x.metrics["block_records"] == 0 || x.metrics["forest_roots"] == 0) {
+		t.Fatal("held fixture lacks excluded Solid transactions or their blocker proof")
 	}
 	return x
 }
@@ -191,6 +261,9 @@ func (x *ablationFixture) service(leader bool) *OFOService {
 
 func (x *ablationFixture) advanceRound(t testing.TB, orders []*types.LocalOrder) {
 	t.Helper()
+	for _, order := range orders {
+		x.warmMaxLO = max(x.warmMaxLO, len(order.OrderedTxs))
+	}
 	follower := x.service(false)
 	candidate, err := x.base.constructCandidate(orders)
 	if err != nil {
@@ -321,7 +394,7 @@ func assertAblationGraph(t testing.TB, a, b *DependencyManager) {
 }
 
 func ablationMetrics(x *ablationFixture) map[string]float64 {
-	m := make(map[string]float64)
+	m := map[string]float64{"lo_max_size": float64(x.base.loMaxSize), "warm_max_lo": float64(x.warmMaxLO), "warm_rounds": float64(x.base.committed.FragmentSeq), "max_lo": 0, "output_tx": 0, "tree_edges": 0, "forest_roots": 0, "forest_max_depth": 0}
 	for _, entry := range []struct {
 		prefix string
 		state  *EvidenceState
@@ -356,6 +429,7 @@ func ablationMetrics(x *ablationFixture) map[string]float64 {
 	m["new_live"] = m["updated_live"] - m["pre_live"]
 	for _, order := range x.orders {
 		m["lo_occurrences"] += float64(len(order.OrderedTxs))
+		m["max_lo"] = max(m["max_lo"], float64(len(order.OrderedTxs)))
 	}
 	f := x.candidate.fragment
 	m["output_batches"] = float64(len(f.FinalOrder.Batches))
@@ -366,6 +440,13 @@ func ablationMetrics(x *ablationFixture) map[string]float64 {
 		m["tree_edges"] += float64(len(claim.InTree) + len(claim.OutTree))
 	}
 	m["block_records"] = float64(len(f.Certificate.BlockForest))
+	for _, record := range f.Certificate.BlockForest {
+		if !record.HasParent {
+			m["forest_roots"]++
+		}
+		m["forest_max_depth"] = max(m["forest_max_depth"], float64(record.Depth))
+	}
+	m["excluded_solid"] = m["updated_solid"] - m["output_tx"]
 	return m
 }
 
