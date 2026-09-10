@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"sort"
 	"sync"
 	"time"
 )
@@ -80,6 +81,7 @@ func NewDistributedNetwork(config NetworkConfig) (*DistributedNetwork, error) {
 	}
 	n.wg.Add(1)
 	go n.acceptConnections()
+	n.wg.Add(1)
 	go n.connectionManager()
 	return n, nil
 }
@@ -148,14 +150,7 @@ func (n *DistributedNetwork) handleIncomingConnection(conn net.Conn) {
 }
 
 func (n *DistributedNetwork) connectionManager() {
-	time.AfterFunc(2*time.Second, func() {
-		for replicaID, addr := range n.config.ReplicaAddr {
-			if replicaID != n.config.ReplicaID {
-				go n.tryConnect(replicaID, addr)
-			}
-		}
-	})
-
+	defer n.wg.Done()
 	ticker := time.NewTicker(2 * time.Second) // 缩短检查间隔
 	defer ticker.Stop()
 
@@ -178,7 +173,8 @@ func (n *DistributedNetwork) connectionManager() {
 			} else {
 				// 如果未全部连接，尝试连接尚未连接的节点
 				for replicaID, addr := range n.config.ReplicaAddr {
-					if replicaID == n.config.ReplicaID {
+					// One dialer per pair; the resulting TCP stream is bidirectional.
+					if replicaID <= n.config.ReplicaID {
 						continue
 					}
 					n.mu.RLock()
@@ -203,12 +199,33 @@ func (n *DistributedNetwork) WaitForPeers(timeout time.Duration) error {
 		return nil
 	case <-time.After(timeout):
 		n.mu.RLock()
-		defer n.mu.RUnlock()
-		return fmt.Errorf("node %d timed out waiting for peers. Connected to %d/%d", n.config.ReplicaID, len(n.connections), len(n.config.ReplicaAddr)-1)
+		var connected, missing []uint64
+		for peerID := range n.config.ReplicaAddr {
+			if peerID == n.config.ReplicaID {
+				continue
+			}
+			if _, ok := n.connections[peerID]; ok {
+				connected = append(connected, peerID)
+			} else {
+				missing = append(missing, peerID)
+			}
+		}
+		n.mu.RUnlock()
+		sort.Slice(connected, func(i, j int) bool { return connected[i] < connected[j] })
+		sort.Slice(missing, func(i, j int) bool { return missing[i] < missing[j] })
+		return fmt.Errorf("node %d timed out waiting for peers. Connected to %d/%d; connected peers=%v; missing peers=%v", n.config.ReplicaID, len(connected), len(n.config.ReplicaAddr)-1, connected, missing)
 	}
 }
 
 func (n *DistributedNetwork) tryConnect(replicaID uint64, addr string) {
+	if replicaID <= n.config.ReplicaID {
+		return
+	}
+	select {
+	case <-n.stopChan:
+		return
+	default:
+	}
 	n.connMu.Lock()
 	if n.connAttempts[replicaID] {
 		n.connMu.Unlock()
@@ -217,13 +234,21 @@ func (n *DistributedNetwork) tryConnect(replicaID uint64, addr string) {
 	n.connAttempts[replicaID] = true
 	n.connMu.Unlock()
 	defer func() { n.connMu.Lock(); n.connAttempts[replicaID] = false; n.connMu.Unlock() }()
+	n.mu.RLock()
+	_, connected := n.connections[replicaID]
+	n.mu.RUnlock()
+	if connected {
+		return
+	}
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
+		log.Printf("Node %d failed to connect to peer %d at %s: %v", n.config.ReplicaID, replicaID, addr, err)
 		return
 	}
 	encoder := gob.NewEncoder(conn)
 	decoder := gob.NewDecoder(conn)
 	if err = encoder.Encode(n.config.ReplicaID); err != nil {
+		log.Printf("Node %d failed to send handshake to peer %d at %s: %v", n.config.ReplicaID, replicaID, addr, err)
 		conn.Close()
 		return
 	}
