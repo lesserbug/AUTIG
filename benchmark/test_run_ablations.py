@@ -44,7 +44,7 @@ class AblationResultsTest(unittest.TestCase):
 
                 # Linux platform probes can invoke subprocess.run via uname;
                 # isolate them from the benchmark-command mock below.
-                with patch("sys.argv", ["run_ablations.py", "--experiment", experiment, "--runs", "1", "--output", str(output)]), \
+                with patch("sys.argv", ["run_ablations.py", "--experiment", experiment, "--case", "common-low", "--runs", "1", "--output", str(output)]), \
                      patch("run_ablations.command_text", return_value="{}"), \
                      patch("run_ablations.platform.processor", return_value="test CPU"), \
                      patch("run_ablations.platform.platform", return_value="test OS"), \
@@ -53,8 +53,10 @@ class AblationResultsTest(unittest.TestCase):
                 commands = [call.args[0] for call in execute.call_args_list]
                 self.assertEqual(commands[0], ["go", "test", "./...", "-count=1"])
                 self.assertIn(f"-test.bench={pattern}", commands[-1])
+                self.assertIn("-ablation-case=common-low", commands[-1])
                 metadata = json.loads((output / "metadata.json").read_text())
                 self.assertEqual(metadata["parameters"]["experiment"], experiment)
+                self.assertEqual(metadata["parameters"]["case"], "common-low")
                 self.assertEqual(metadata["commands"], commands)
                 self.assertTrue((output / "summary.csv").exists())
 

@@ -13,13 +13,14 @@ import (
 
 // These flags belong only to the Go test binary, never to the production node.
 var (
-	ablationNodes   = flag.String("ablation-nodes", "10,50", "Logical replica counts")
-	ablationFaults  = flag.Uint64("ablation-f", 1, "Use the final main-experiment fault parameter")
-	ablationGamma   = flag.Float64("ablation-gamma", .9, "Use the final main-experiment gamma")
-	ablationSeeds   = flag.String("ablation-seeds", "1,7,19", "Fixed sample seeds")
-	ablationHistory = flag.Int("ablation-history", 480, "Retained transactions in large synthetic cases (at least 6)")
-	ablationLOSize  = flag.Int("ablation-lo-size", 200, "Maximum transactions per signed LocalOrder, including warm-up")
-	ablationOrder   = flag.String("ablation-order", "AB", "Branch execution order: AB or BA")
+	ablationNodes    = flag.String("ablation-nodes", "10,50", "Logical replica counts")
+	ablationFaults   = flag.Uint64("ablation-f", 1, "Use the final main-experiment fault parameter")
+	ablationGamma    = flag.Float64("ablation-gamma", .9, "Use the final main-experiment gamma")
+	ablationSeeds    = flag.String("ablation-seeds", "1,7,19", "Fixed sample seeds")
+	ablationHistory  = flag.Int("ablation-history", 480, "Retained transactions in large synthetic cases (at least 6)")
+	ablationLOSize   = flag.Int("ablation-lo-size", 200, "Maximum transactions per signed LocalOrder, including warm-up")
+	ablationOrder    = flag.String("ablation-order", "AB", "Branch execution order: AB or BA")
+	ablationCaseName = flag.String("ablation-case", "all", "Exact workload name, or all")
 )
 
 func ablationIntegers(t testing.TB, value string) []int64 {
@@ -49,11 +50,27 @@ func benchmarkAblation(b *testing.B, graph bool) {
 	if *ablationOrder != "AB" && *ablationOrder != "BA" {
 		b.Fatal("ablation-order must be AB or BA")
 	}
+	cases := ablationCases(*ablationHistory)
+	if graph {
+		cases = ablationGraphCases(*ablationHistory)
+	}
+	if *ablationCaseName != "all" {
+		var selected []ablationCase
+		for _, c := range cases {
+			if c.name == *ablationCaseName {
+				selected = append(selected, c)
+			}
+		}
+		if len(selected) == 0 {
+			b.Fatalf("case %q is not available for this experiment", *ablationCaseName)
+		}
+		cases = selected
+	}
 	for _, n := range ablationIntegers(b, *ablationNodes) {
 		if n < 2 {
 			b.Fatal("need at least two logical replicas")
 		}
-		for _, c := range ablationCases(*ablationHistory) {
+		for _, c := range cases {
 			c.loMaxSize = *ablationLOSize
 			for _, seed := range ablationIntegers(b, *ablationSeeds) {
 				name := fmt.Sprintf("n%d_f%d_g%g/%s/seed%d", n, *ablationFaults, *ablationGamma, c.name, seed)

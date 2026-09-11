@@ -91,6 +91,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--experiment", choices=EXPERIMENT_BENCHMARKS, default="all",
                         help="Collect experiment 3 (graph), 4 (follower), or both; correctness checks always run")
+    parser.add_argument("--case", default="all", help="Exact workload name, or all; use with --experiment for a supplementary run")
     parser.add_argument("--nodes", default="10,50")
     parser.add_argument("--faults", type=int, default=1)
     parser.add_argument("--gamma", type=float, default=.9)
@@ -143,7 +144,8 @@ def main():
         command = [str(binary), "-test.run=^$", f"-test.bench={EXPERIMENT_BENCHMARKS[args.experiment]}",
                    "-test.benchmem", f"-test.benchtime={args.benchtime}", "-test.count=1", "-test.cpu=1",
                    f"-ablation-nodes={args.nodes}", f"-ablation-f={args.faults}", f"-ablation-gamma={args.gamma}",
-                   f"-ablation-seeds={args.seeds}", f"-ablation-history={args.history}", f"-ablation-lo-size={args.lo_size}", f"-ablation-order={order}"]
+                   f"-ablation-seeds={args.seeds}", f"-ablation-history={args.history}", f"-ablation-lo-size={args.lo_size}", f"-ablation-order={order}",
+                   f"-ablation-case={args.case}"]
         execute(command, log)
         rows = parse_benchmarks(log.read_text(encoding="utf-8"))
         raw.extend(dict(row, run=run, order=order) for row in rows)

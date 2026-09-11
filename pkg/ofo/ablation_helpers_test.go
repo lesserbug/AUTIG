@@ -21,6 +21,7 @@ type ablationCase struct {
 	cycle, release bool
 	delayed        bool
 	blocked        bool
+	partialRelease bool // release a small historical prefix, retaining the backlog
 }
 
 type ablationFixture struct {
@@ -47,6 +48,15 @@ func ablationCases(history int) []ablationCase {
 	}
 }
 
+// The supplementary nonempty-output family belongs only to experiment 3.
+// Preserve experiment 4's original case list and inputs.
+func ablationGraphCases(history int) []ablationCase {
+	return append(ablationCases(history), ablationCase{
+		name: "synthetic-large-sparse-output", history: history,
+		fresh: min(8, history/2), partialRelease: true,
+	})
+}
+
 // Use the production collector's rotating sender set, then canonicalize it.
 func ablationSenders(n, f, seq uint64) []uint64 {
 	var ids []uint64
@@ -69,6 +79,9 @@ func makeAblationFixture(t testing.TB, n, f uint64, gamma float64, c ablationCas
 	}
 	if limit < 3 || c.fresh > limit || (c.release && c.fresh >= limit) {
 		t.Fatalf("LO limit %d cannot accommodate this case's fresh extension (%d)", limit, c.fresh)
+	}
+	if c.partialRelease && (c.fresh <= 0 || c.fresh >= c.history) {
+		t.Fatal("partial release requires a nonempty proper historical prefix")
 	}
 	s, err := NewOFOService(0, n, f, gamma, newTestNetwork(), limit, nil, false, x.auth, x.admission, context, genesis, func(*types.VerifiableFairOrderFragment, [32]byte) {})
 	if err != nil {
@@ -142,13 +155,18 @@ func makeAblationFixture(t testing.TB, n, f uint64, gamma float64, c ablationCas
 	// For cycles, add the least represented rotation to preserve the large SCC.
 	var releaser uint64
 	var releaseTail []types.TxID
-	if c.release {
+	if c.release || c.partialRelease {
 		for {
 			if _, ok := reporters[releaser]; !ok {
 				break
 			}
 			releaser++
 		}
+	}
+	if c.partialRelease {
+		releaseTail = history[:c.fresh]
+	}
+	if c.release {
 		releaseTail = historyOrder(len(reporters) % 3)
 		if !c.cycle && len(releaseTail)+c.fresh > limit {
 			t.Fatal("ordered release must fit one LO to retain all history until the sample")
@@ -169,7 +187,7 @@ func makeAblationFixture(t testing.TB, n, f uint64, gamma float64, c ablationCas
 	// the maximal safe output is empty. No state maps are hand-populated.
 	x.advanceRound(t, ordersFor(func(uint64) []types.TxID { return nil }))
 	// The final release/late-Done reporter must belong to the measured round.
-	if c.release || c.delayed {
+	if c.release || c.partialRelease || c.delayed {
 		required := releaser
 		if c.delayed {
 			required = 0
@@ -188,6 +206,11 @@ func makeAblationFixture(t testing.TB, n, f uint64, gamma float64, c ablationCas
 		}
 	}
 	x.orders = ordersFor(func(r uint64) []types.TxID {
+		if c.partialRelease && r == releaser {
+			// Replace this sender's fresh chunk with the same-sized historical
+			// prefix. Total LO occurrences/new positions match large-few.
+			return releaseTail
+		}
 		var ids []types.TxID
 		if c.release && r == releaser {
 			ids = append(ids, releaseTail...)
@@ -216,13 +239,28 @@ func makeAblationFixture(t testing.TB, n, f uint64, gamma float64, c ablationCas
 	if c.release && x.metrics["output_tx"] != float64(c.history+c.fresh) {
 		t.Fatal("release fixture did not output all history and fresh transactions")
 	}
-	if !c.release && c.history > 0 && x.metrics["output_tx"] != 0 {
+	if !c.release && !c.partialRelease && c.history > 0 && x.metrics["output_tx"] != 0 {
 		t.Fatal("held fixture unexpectedly released output")
+	}
+	if c.partialRelease {
+		var output []types.TxID
+		for _, batch := range x.candidate.fragment.FinalOrder.Batches {
+			output = append(output, batch.Transactions...)
+		}
+		if !sameIDs(output, releaseTail) || len(x.candidate.postState.Live) != c.history {
+			t.Fatal("partial release must output exactly the prefix and retain the backlog size")
+		}
+		if x.metrics["pre_max_scc"] != 1 || x.metrics["updated_max_scc"] != 1 {
+			t.Fatal("partial release must not introduce a large SCC transition")
+		}
+		if x.metrics["new_live"] != float64(c.fresh) || x.metrics["new_positions"] != float64((n-f)*uint64(c.fresh)) {
+			t.Fatal("partial release changed the specified new-transaction/position budget")
+		}
 	}
 	if c.blocked && (x.metrics["pre_shaded"] != 3 || x.metrics["pre_solid"] != float64(c.history-3)) {
 		t.Fatal("blocked fixture lost its Shaded roots or retained Solid history")
 	}
-	if !c.release && c.history > 0 && (c.fresh > 0 || c.blocked) && (x.metrics["excluded_solid"] == 0 || x.metrics["block_records"] == 0 || x.metrics["forest_roots"] == 0) {
+	if !c.release && !c.partialRelease && c.history > 0 && (c.fresh > 0 || c.blocked) && (x.metrics["excluded_solid"] == 0 || x.metrics["block_records"] == 0 || x.metrics["forest_roots"] == 0) {
 		t.Fatal("held fixture lacks excluded Solid transactions or their blocker proof")
 	}
 	return x

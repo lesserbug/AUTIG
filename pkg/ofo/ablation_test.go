@@ -675,3 +675,38 @@ func TestAblationBoundedLocalOrders(t *testing.T) {
 		}
 	}
 }
+
+func TestAblationSparseNonemptyOutput(t *testing.T) {
+	for _, n := range []uint64{10, 50} {
+		for _, seed := range []int64{1, 7, 19} {
+			t.Run(fmt.Sprintf("n%d/seed%d", n, seed), func(t *testing.T) {
+				cases := ablationGraphCases(30)
+				c := cases[len(cases)-1]
+				c.loMaxSize = 16 // exercise bounded, multi-round accumulation
+				x := makeAblationFixture(t, n, 1, .9, c, seed)
+				checkAblationGraph(t, x)
+				checkAblationVerifier(t, x, x.candidate.fragment, 0, true)
+				if x.metrics["warm_max_lo"] > 16 || x.metrics["max_lo"] != float64(c.fresh) {
+					t.Fatal("partial release exceeded the per-LocalOrder budget")
+				}
+				if x.metrics["touched_nodes"] != float64(2*c.fresh) ||
+					x.metrics["touched_pairs"] > float64(c.history*c.fresh+c.fresh*(c.fresh-1)) {
+					t.Fatal("partial release touched more than its small frontier")
+				}
+				// Matched history and position budget, but legally different evidence.
+				c.partialRelease = false
+				control := makeAblationFixture(t, n, 1, .9, c, seed)
+				assertAblationState(t, x.base.committed, control.base.committed)
+				assertAblationGraph(t, x.base.UtigManager, control.base.UtigManager)
+				for _, metric := range []string{"pre_live", "new_live", "new_positions", "lo_occurrences"} {
+					if x.metrics[metric] != control.metrics[metric] {
+						t.Fatalf("matched case differs in %s", metric)
+					}
+				}
+				if control.metrics["output_tx"] != 0 || x.metrics["output_tx"] != float64(c.fresh) {
+					t.Fatal("matched cases do not distinguish zero from modest nonempty output")
+				}
+			})
+		}
+	}
+}
