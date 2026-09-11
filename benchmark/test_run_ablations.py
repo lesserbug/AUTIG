@@ -42,8 +42,12 @@ class AblationResultsTest(unittest.TestCase):
                     if any(arg.startswith("-test.bench=") for arg in command):
                         kwargs["stdout"].write(records)
 
+                # Linux platform probes can invoke subprocess.run via uname;
+                # isolate them from the benchmark-command mock below.
                 with patch("sys.argv", ["run_ablations.py", "--experiment", experiment, "--runs", "1", "--output", str(output)]), \
                      patch("run_ablations.command_text", return_value="{}"), \
+                     patch("run_ablations.platform.processor", return_value="test CPU"), \
+                     patch("run_ablations.platform.platform", return_value="test OS"), \
                      patch("run_ablations.subprocess.run", side_effect=run) as execute:
                     main()
                 commands = [call.args[0] for call in execute.call_args_list]
