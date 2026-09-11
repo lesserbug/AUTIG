@@ -291,12 +291,15 @@ by both verifiers. The tests compare decisions and state effects, not error text
 | Graph maintenance | `refresh` versus allocation and complete materialization from the **same already-updated state**. Evidence and restoration of the incremental graph/touch snapshot are outside timing. | Production `constructCandidate` versus a test-only rebuild wrapper: sorting, state copies, evidence checks/update, graph work, output/certificate generation, post-state processing, evidence copy, digest, leader signing and pending state. |
 | Follower verification | Production certificate verification versus complete graph materialization, SCC/maximal safe output/deterministic order recomputation and checks of the **supplied** proof using graph edges. | Production `verifyCandidate` versus a test-only wrapper retaining context, digest/signature checks, evidence validation/update, state copies, pre/post IDs, finalization and pending state. |
 
-Full incremental construction includes **both** production graph copies. The
-rebuild constructor does not collect unneeded graph touches, so its Full ratio
-includes that difference; Core isolates graph maintenance. Both constructors
-retain the same post-state/post-manager copying sequence. A rebuild stores
-nonzero weight entries; the incremental cache can also contain explicit zeros.
-Both cache sizes are reported; no artificial padding is added for map equality.
+Full incremental construction includes the production copy of the committed
+graph. Once output/certificate construction finishes, that candidate-local graph
+is finalized in place; no pre-finalize graph is retained. The rebuild constructor
+uses the same ownership rule, without an unnecessary second graph copy. Both
+constructors still copy pre/post evidence states and perform all finalization,
+digest and signing work. The rebuild constructor does not collect unneeded graph
+touches, so its Full ratio includes that difference; Core isolates graph
+maintenance. Incremental and rebuilt caches omit zero weight entries, whose
+absence already reads as zero. Both cache sizes are reported.
 
 The recompute verifier generates no new proof and does not call the entire
 production certificate verifier after recomputation. Exact recomputed batches
@@ -362,7 +365,17 @@ python3 benchmark/run_ablations.py --nodes 10,50 --faults 1 --gamma 0.9 --seeds 
 ```
 
 Use the main experiment's final `f/gamma` in that command. Each process covers
-both experiments, Core/Full and every sample. Normally use 3-5 processes; more
+both experiments by default, Core/Full and every sample. To collect only
+experiment 3 after a leader-only change, use:
+
+```text
+python3 benchmark/run_ablations.py --experiment 3 --nodes 10,50 --faults 1 --gamma 0.9 --seeds 1,7,19 --history 480 --lo-size 200 --runs 4 --benchtime 1s
+```
+
+`--experiment 4` selects follower verification alone; `--experiment all` is the
+default. Selection changes only the timed benchmark entry point. All correctness
+tests and the selected samples' untimed graph/verifier preflight still run.
+The selected experiment is recorded in `metadata.json`. Normally use 3-5 processes; more
 iterations improve within-sample precision but do not replace distinct seeds or
 processes. The command only uses the current machine; it creates no AWS resource.
 Instance type/region are operator-supplied metadata, not independently detected.
@@ -391,3 +404,32 @@ directory supplied with `--output`):
 Report results as sorting construction/verification microbenchmark gains on the
 same hardware. A verification speedup does not imply an equal finalized-TPS gain;
 the distributed main experiment measures that conversion.
+
+### Comparing leader-only revisions
+
+The leader optimization removes explicit zero graph-cache weights and the
+redundant second graph copy. Apply the ownership improvement to **both** experiment
+3 constructors; do not compare a new incremental branch to an old rebuild branch.
+It changes neither evidence state/thresholds nor output/certificate rules, and
+does not alter either timed follower verifier or the shared rebuild helper used
+by experiment 4. The first committed-graph copy and touch generation remain in
+incremental Full timing. No workload-dependent rebuild switch is introduced.
+
+Keep old measurements and their commit metadata. Recollect both branches of
+experiment 3 together with the same parameters/hardware; do not pool revisions.
+Experiment 4 measurements can remain associated with their original revision
+when its measured code/dependencies and logical inputs are unchanged. Retain
+full verifier regression checks and verify sample/candidate equivalence after
+leader changes. Any future change to shared evidence/state, graph reconstruction
+or verification code requires reassessing whether experiment 4 must be rerun.
+The graph-cache weight-count metric changes with this representation optimization;
+it is not a change to authoritative weights, graph edges or candidate evidence.
+Untimed leader fixture caches also occupy less heap, which may affect GC/cache
+conditions. Unchanged verifier code does not establish identical timing for a
+new binary; do not label old experiment 4 data as collected on the new revision.
+
+Do not promise a Full speedup from removing these allocations. Sparse-update Core
+savings and complete-construction results answer different questions. Report
+regressions and no-change cases as well as gains, and use the measured B/op and
+allocs/op without attributing a percentage of CPU time to a stage from allocation
+counts or independently measured Full-minus-Core differences.

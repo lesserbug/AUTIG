@@ -413,6 +413,16 @@ func checkAblationGraph(t testing.TB, x *ablationFixture) {
 	}
 	incremental := s.UtigManager.clone()
 	incremental.refresh(updated, nodes, pairs)
+	for key, weight := range incremental.weights {
+		if weight == 0 || weight != updated.weights[key] {
+			t.Fatal("incremental cache must retain only correct nonzero weights")
+		}
+	}
+	for key, weight := range updated.weights {
+		if incremental.weights[key] != weight {
+			t.Fatal("incremental cache lost a cumulative weight")
+		}
+	}
 	rebuilt := rebuildDependencyManagerForTest(updated, s.replicaCount, s.fFaulty, s.gamma)
 	assertAblationGraph(t, incremental, rebuilt)
 	assertAblationState(t, updated, x.candidate.preState)
@@ -503,6 +513,65 @@ func checkAblationPositionCaches(t testing.TB, s *EvidenceState, n, f uint64, ga
 		}
 		if s.states[id] != want {
 			t.Fatal("position-derived classification differs")
+		}
+	}
+}
+
+type ablationFailingLeaderSigner struct{ types.Authenticator }
+
+func (ablationFailingLeaderSigner) SignLeader(types.AuthContext, [32]byte) ([]byte, error) {
+	return nil, fmt.Errorf("injected leader signing failure")
+}
+
+// Finalization may consume the candidate-local graph, including on a later
+// signing failure or abandonment, but must never modify the committed snapshot.
+func TestAblationLeaderConstructionIsolation(t *testing.T) {
+	for _, release := range []bool{false, true} {
+		x := makeAblationFixture(t, 10, 1, .9, ablationCase{name: "isolation", history: 30, fresh: 6, cycle: true, release: release}, 7)
+		for name, construct := range map[string]func(*OFOService, []*types.LocalOrder) (*pendingCandidate, error){
+			"incremental": (*OFOService).constructCandidate,
+			"rebuild":     constructCandidateByRebuildForTest,
+		} {
+			t.Run(fmt.Sprintf("release=%t/%s", release, name), func(t *testing.T) {
+				s := x.service(true)
+				state, manager := s.committed.clone(), s.UtigManager.clone()
+				assertUnchanged := func() {
+					t.Helper()
+					assertAblationState(t, s.committed, state)
+					if !reflect.DeepEqual(s.UtigManager, manager) {
+						t.Fatal("construction mutated the committed graph/cache")
+					}
+				}
+				s.auth = ablationFailingLeaderSigner{x.auth}
+				if _, err := construct(s, x.orders); err == nil || s.pending != nil {
+					t.Fatal("signing failure installed a candidate")
+				}
+				assertUnchanged()
+				s.auth = x.auth
+				candidate, err := construct(s, x.orders)
+				if err != nil {
+					t.Fatal(err)
+				}
+				assertUnchanged()
+				assertAblationState(t, candidate.preState, x.candidate.preState)
+				if candidate.digest != x.candidate.digest || !s.AbandonPending(candidate.digest) {
+					t.Fatal("candidate differs or could not be abandoned")
+				}
+				assertUnchanged()
+				retry, err := construct(s, x.orders)
+				if err != nil || retry.digest != candidate.digest {
+					t.Fatalf("retry after abandonment differs: %v", err)
+				}
+				if _, ok := s.CommitPending(retry.digest); !ok {
+					t.Fatal("retry commit failed")
+				}
+				assertAblationState(t, s.committed, x.candidate.postState)
+				assertAblationGraph(t, s.UtigManager, x.candidate.manager)
+				assertAblationState(t, x.base.committed, state)
+				if !reflect.DeepEqual(x.base.UtigManager, manager) {
+					t.Fatal("commit mutated the original fixture graph")
+				}
+			})
 		}
 	}
 }

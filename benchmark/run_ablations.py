@@ -17,6 +17,11 @@ import time
 
 
 ROOT = Path(__file__).resolve().parents[1]
+EXPERIMENT_BENCHMARKS = {
+    "all": "^BenchmarkAblation",
+    "3": "^BenchmarkAblationGraphMaintenance$",
+    "4": "^BenchmarkAblationFollowerVerification$",
+}
 
 
 def parse_benchmarks(text):
@@ -84,6 +89,8 @@ def command_text(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--experiment", choices=EXPERIMENT_BENCHMARKS, default="all",
+                        help="Collect experiment 3 (graph), 4 (follower), or both; correctness checks always run")
     parser.add_argument("--nodes", default="10,50")
     parser.add_argument("--faults", type=int, default=1)
     parser.add_argument("--gamma", type=float, default=.9)
@@ -133,7 +140,7 @@ def main():
     for run in range(1, args.runs + 1):
         order = "AB" if run % 2 else "BA"
         log = output / f"run-{run:02d}-{order}.log"
-        command = [str(binary), "-test.run=^$", "-test.bench=^BenchmarkAblation",
+        command = [str(binary), "-test.run=^$", f"-test.bench={EXPERIMENT_BENCHMARKS[args.experiment]}",
                    "-test.benchmem", f"-test.benchtime={args.benchtime}", "-test.count=1", "-test.cpu=1",
                    f"-ablation-nodes={args.nodes}", f"-ablation-f={args.faults}", f"-ablation-gamma={args.gamma}",
                    f"-ablation-seeds={args.seeds}", f"-ablation-history={args.history}", f"-ablation-lo-size={args.lo_size}", f"-ablation-order={order}"]

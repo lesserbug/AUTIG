@@ -331,8 +331,9 @@ func constructCandidateByRebuildForTest(s *OFOService, orders []*types.LocalOrde
 	if err != nil {
 		return nil, err
 	}
-	post, postManager := pre.clone(), manager.clone()
-	finalize(post, postManager, order, cert.Part)
+	// Match production ownership: the freshly built graph is candidate-local.
+	post := pre.clone()
+	finalize(post, manager, order, cert.Part)
 	fragment := &types.VerifiableFairOrderFragment{
 		Epoch: s.authContext.Epoch, AuthContextID: s.authContext.Identifier, LeaderID: s.authContext.LeaderID,
 		FragmentSeq: seq, PreviousStateID: s.committed.StateID, PreviousFragmentDigest: s.latestCommittedFragment,
@@ -344,7 +345,7 @@ func constructCandidateByRebuildForTest(s *OFOService, orders []*types.LocalOrde
 	if err != nil {
 		return nil, err
 	}
-	s.pending = &pendingCandidate{digest: digest, preState: pre, postState: post, manager: postManager, fragment: fragment, done: make(chan struct{})}
+	s.pending = &pendingCandidate{digest: digest, preState: pre, postState: post, manager: manager, fragment: fragment, done: make(chan struct{})}
 	return s.pending, nil
 }
 

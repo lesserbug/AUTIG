@@ -1,6 +1,10 @@
+import json
+from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 
-from run_ablations import pair_results, parse_benchmarks
+from run_ablations import main, pair_results, parse_benchmarks
 
 
 class AblationResultsTest(unittest.TestCase):
@@ -24,6 +28,31 @@ class AblationResultsTest(unittest.TestCase):
         rows[1]["metrics"]["pre_live"] = 13
         with self.assertRaises(ValueError):
             pair_results(rows, 1, "AB")
+
+    def test_experiment_selection_and_metadata(self):
+        for experiment, pattern in (("3", "^BenchmarkAblationGraphMaintenance$"),
+                                    ("4", "^BenchmarkAblationFollowerVerification$")):
+            with self.subTest(experiment=experiment), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "results"
+                records = self.records()
+                if experiment == "4":
+                    records = records.replace("GraphMaintenance", "FollowerVerification").replace("Incremental", "Certificate").replace("Rebuild", "Recompute")
+
+                def run(command, **kwargs):
+                    if any(arg.startswith("-test.bench=") for arg in command):
+                        kwargs["stdout"].write(records)
+
+                with patch("sys.argv", ["run_ablations.py", "--experiment", experiment, "--runs", "1", "--output", str(output)]), \
+                     patch("run_ablations.command_text", return_value="{}"), \
+                     patch("run_ablations.subprocess.run", side_effect=run) as execute:
+                    main()
+                commands = [call.args[0] for call in execute.call_args_list]
+                self.assertEqual(commands[0], ["go", "test", "./...", "-count=1"])
+                self.assertIn(f"-test.bench={pattern}", commands[-1])
+                metadata = json.loads((output / "metadata.json").read_text())
+                self.assertEqual(metadata["parameters"]["experiment"], experiment)
+                self.assertEqual(metadata["commands"], commands)
+                self.assertTrue((output / "summary.csv").exists())
 
 
 if __name__ == "__main__":

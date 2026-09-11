@@ -376,9 +376,10 @@ func (s *OFOService) constructCandidate(orders []*types.LocalOrder) (*pendingCan
 	}
 	span.Mark("proposal_built")
 	postState := preState.clone()
-	postManager := manager.clone()
 	span.Mark("post_cloned")
-	finalize(postState, postManager, finalOrder, certificate.Part)
+	// manager already belongs exclusively to this candidate. No pre-finalize
+	// graph is retained, so finalize it in place; committed state stays isolated.
+	finalize(postState, manager, finalOrder, certificate.Part)
 	span.Mark("finalized")
 	fragment := &types.VerifiableFairOrderFragment{
 		Epoch: s.authContext.Epoch, AuthContextID: s.authContext.Identifier, LeaderID: s.authContext.LeaderID,
@@ -414,7 +415,7 @@ func (s *OFOService) constructCandidate(orders []*types.LocalOrder) (*pendingCan
 		span.Set("certificate_block_records", len(certificate.BlockForest))
 		span.Set("accepted", true)
 	}
-	candidate := &pendingCandidate{digest: digest, preState: preState, postState: postState, manager: postManager, fragment: fragment, done: make(chan struct{})}
+	candidate := &pendingCandidate{digest: digest, preState: preState, postState: postState, manager: manager, fragment: fragment, done: make(chan struct{})}
 	s.pending = candidate
 	return candidate, nil
 }

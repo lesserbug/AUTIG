@@ -375,8 +375,15 @@ func (dm *DependencyManager) refresh(state *EvidenceState, touchedNodes map[type
 		}
 	}
 	for pair := range touchedPairs {
-		dm.weights[edgeKey{pair.a, pair.b}] = state.weights[edgeKey{pair.a, pair.b}]
-		dm.weights[edgeKey{pair.b, pair.a}] = state.weights[edgeKey{pair.b, pair.a}]
+		// Absent weights already read as zero. Avoid retaining and cloning a
+		// zero entry for every unobserved direction of a transaction pair.
+		for _, key := range [...]edgeKey{{pair.a, pair.b}, {pair.b, pair.a}} {
+			if weight := state.weights[key]; weight != 0 {
+				dm.weights[key] = weight
+			} else {
+				delete(dm.weights, key)
+			}
+		}
 		dm.refreshPair(pair.a, pair.b)
 	}
 }
