@@ -29,8 +29,10 @@ class OfferedRateResultTests(unittest.TestCase):
     def write_result(self):
         with tempfile.TemporaryDirectory() as directory:
             warning = io.StringIO()
-            with patch.object(fabfile, "RESULT_DIR", Path(directory)), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(warning):
+            console = io.StringIO()
+            with patch.object(fabfile, "RESULT_DIR", Path(directory)), contextlib.redirect_stdout(console), contextlib.redirect_stderr(warning):
                 fabfile._write_result("local", self.parameters, 1, self.metrics)
+            self.console = console.getvalue()
             paths = list(Path(directory).glob("*.json"))
             self.assertEqual(len(paths), 1)
             return json.loads(paths[0].read_text(encoding="utf-8")), warning.getvalue()
@@ -81,6 +83,14 @@ class OfferedRateResultTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "same final committed"):
             self.write_result()
 
+    def test_console_omits_state_and_addresses_but_saved_result_retains_them(self):
+        self.metrics["replica_instances"] = {"0": {"public_ip": "192.0.2.1"}}
+        result, _ = self.write_result()
+        self.assertNotIn("replica_states", self.console)
+        self.assertNotIn("192.0.2.1", self.console)
+        self.assertIn("replica_states", result)
+        self.assertEqual(result["replica_instances"]["0"]["public_ip"], "192.0.2.1")
+
 
 class DiagnosticMetadataTests(unittest.TestCase):
     def test_build_identity_is_from_binary_log_and_unknown_is_explicit(self):
@@ -97,6 +107,58 @@ class DiagnosticMetadataTests(unittest.TestCase):
         parameters.update(stage_timing=True, cpuprofile=True)
         enabled = fabfile._command(parameters, [0], binary="autig")
         self.assertEqual(enabled, command + ["-stage-timing", "-cpuprofile"])
+
+
+class MechanismTests(unittest.TestCase):
+    def records(self):
+        return {
+            "finalized": 100,
+            "mechanism_nodes": {
+                str(i): {
+                    "replica": i, "window_seconds": 10,
+                    "counts": {"lo_fresh": 5, "lo_retransmit_attempts": 10,
+                               "lo_signatures": 6, "committed_fragments": 5,
+                               "network_local_order_messages": 15, "network_local_order_bytes": 1000},
+                    "samples": {"lo_fresh_ids": {"count": 5, "sum": 100},
+                                "fragment_output_transactions": {"count": 5, "sum": 100},
+                                "receipt_queue": {"max": 40, "last": 3},
+                                **({"construct_wall_ns": {"count": 5, "sum": 10000000}} if i == 0 else {})},
+                } for i in range(2)
+            },
+            "cpu_processes": [{"replicas": [0, 1], "sample_seconds": 10, "cpu_seconds": 2}],
+        }
+
+    def test_aggregate_uses_unique_leader_commits_and_process_cpu(self):
+        result = fabfile._mechanism_summary(self.records(), 2)
+        self.assertEqual(result["lo_fresh"], 10)
+        self.assertEqual(result["lo_fresh_per_second"], 1)
+        self.assertEqual(result["lo_signatures"], 12)
+        self.assertEqual(result["lo_fresh_ids_mean"], 20)
+        self.assertEqual(result["committed_fragments"], 5)
+        self.assertEqual(result["construct_wall_mean_ms"], 2)
+        self.assertEqual(result["network"]["local_order"]["bytes_per_committed_tx"], 20)
+        self.assertEqual(result["cpu_ms_per_committed_tx"], 20)
+
+    def test_missing_reports_and_zero_completions(self):
+        records = self.records()
+        records["finalized"] = 0
+        self.assertIsNone(fabfile._mechanism_summary(records, 2)["cpu_ms_per_committed_tx"])
+        records["cpu_processes"].append(records["cpu_processes"][0])
+        with self.assertRaisesRegex(RuntimeError, "CPU reports"):
+            fabfile._mechanism_summary(records, 2)
+        del records["mechanism_nodes"]["1"]
+        with self.assertRaisesRegex(RuntimeError, "mechanism reports"):
+            fabfile._mechanism_summary(records, 2)
+
+    def test_parse_and_reject_duplicate_report(self):
+        records = self.records()
+        text = "\n".join("BENCHMARK MECHANISM " + json.dumps(r) for r in records["mechanism_nodes"].values())
+        text += "\nBENCHMARK CPU " + json.dumps(records["cpu_processes"][0])
+        parsed = fabfile._parse_mechanism(text)
+        self.assertEqual(parsed["mechanism_nodes"], records["mechanism_nodes"])
+        self.assertEqual(parsed["cpu_processes"], records["cpu_processes"])
+        with self.assertRaisesRegex(RuntimeError, "duplicate"):
+            fabfile._parse_mechanism(text + "\n" + text)
 
 
 if __name__ == "__main__":

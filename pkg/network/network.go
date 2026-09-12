@@ -2,6 +2,7 @@
 package network
 
 import (
+	"SpeedFair_simplify/pkg/diagnostics"
 	"encoding/gob"
 	"fmt"
 	"log"
@@ -31,6 +32,8 @@ type NetworkConfig struct {
 }
 
 type DistributedNetwork struct {
+	// Set before registering the handler or sending benchmark messages.
+	Benchmark    *diagnostics.Mechanism
 	config       NetworkConfig
 	handler      func(Message)
 	connections  map[uint64]*peerConn
@@ -48,9 +51,23 @@ type DistributedNetwork struct {
 }
 
 type peerConn struct {
-	conn net.Conn
-	enc  *gob.Encoder
-	mu   sync.Mutex
+	conn   net.Conn
+	enc    *gob.Encoder
+	writer *countingWriter
+	mu     sync.Mutex
+}
+
+// Count the existing Gob stream without encoding a second time or buffering it.
+// The peer's send mutex protects this writer after the handshake.
+type countingWriter struct {
+	conn  net.Conn
+	bytes uint64
+}
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	n, err := w.conn.Write(p)
+	w.bytes += uint64(n)
+	return n, err
 }
 
 func NewDistributedNetwork(config NetworkConfig) (*DistributedNetwork, error) {
@@ -118,7 +135,8 @@ func (n *DistributedNetwork) acceptConnections() {
 
 func (n *DistributedNetwork) handleIncomingConnection(conn net.Conn) {
 	decoder := gob.NewDecoder(conn)
-	encoder := gob.NewEncoder(conn)
+	writer := &countingWriter{conn: conn}
+	encoder := gob.NewEncoder(writer)
 	var peerID uint64
 	if err := decoder.Decode(&peerID); err != nil {
 		conn.Close()
@@ -128,7 +146,7 @@ func (n *DistributedNetwork) handleIncomingConnection(conn net.Conn) {
 	if existingConn, exists := n.connections[peerID]; exists {
 		existingConn.conn.Close()
 	}
-	n.connections[peerID] = &peerConn{conn: conn, enc: encoder}
+	n.connections[peerID] = &peerConn{conn: conn, enc: encoder, writer: writer}
 	n.mu.Unlock()
 	for {
 		var msg Message
@@ -245,7 +263,8 @@ func (n *DistributedNetwork) tryConnect(replicaID uint64, addr string) {
 		log.Printf("Node %d failed to connect to peer %d at %s: %v", n.config.ReplicaID, replicaID, addr, err)
 		return
 	}
-	encoder := gob.NewEncoder(conn)
+	writer := &countingWriter{conn: conn}
+	encoder := gob.NewEncoder(writer)
 	decoder := gob.NewDecoder(conn)
 	if err = encoder.Encode(n.config.ReplicaID); err != nil {
 		log.Printf("Node %d failed to send handshake to peer %d at %s: %v", n.config.ReplicaID, replicaID, addr, err)
@@ -256,7 +275,7 @@ func (n *DistributedNetwork) tryConnect(replicaID uint64, addr string) {
 	if existingConn, exists := n.connections[replicaID]; exists {
 		existingConn.conn.Close()
 	}
-	n.connections[replicaID] = &peerConn{conn: conn, enc: encoder}
+	n.connections[replicaID] = &peerConn{conn: conn, enc: encoder, writer: writer}
 	n.mu.Unlock()
 	for {
 		var msg Message
@@ -283,7 +302,9 @@ func (n *DistributedNetwork) Register(replicaID uint64, handler func(Message)) {
 	}
 }
 
-func (n *DistributedNetwork) Send(msg Message) bool {
+func (n *DistributedNetwork) Send(msg Message) (success bool) {
+	var written uint64
+	defer func() { n.Benchmark.Network(msg.Type, msg.To == n.config.ReplicaID, success, written) }()
 	if msg.To == n.config.ReplicaID {
 		select {
 		case n.msgQueue <- msg:
@@ -300,6 +321,8 @@ func (n *DistributedNetwork) Send(msg Message) bool {
 	}
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
+	before := pc.writer.bytes
+	defer func() { written = pc.writer.bytes - before }()
 	// Bound blocked writes so benchmark shutdown cannot wait indefinitely.
 	_ = pc.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	if err := pc.enc.Encode(msg); err != nil {

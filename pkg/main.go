@@ -217,6 +217,7 @@ func runDistributedMode(rootCtx context.Context, nodeIDs []uint64, maliciousThre
 				return
 			}
 			defer service.Stop()
+			net.Benchmark = service.Benchmark
 			if hosting != nil {
 				hosting.leader = service
 				close(hosting.ready)
@@ -344,6 +345,28 @@ func runDistributedMode(rootCtx context.Context, nodeIDs []uint64, maliciousThre
 	if isLeaderInstance {
 		services[authContext.LeaderID].MeasurementDeadline = experimentStartTime.Add(measurementDuration)
 	}
+	for _, service := range services {
+		service.Benchmark.Begin(experimentStartTime, experimentStartTime.Add(measurementDuration))
+	}
+	// CPU is per process (one node per EC2 in remote runs), including all goroutines.
+	cpuStart, cpuStartErr := diagnostics.ProcessCPUTime()
+	cpuWallStart := time.Now()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-experimentCtx.Done()
+		cpuEnd, cpuEndErr := diagnostics.ProcessCPUTime()
+		seconds := time.Since(cpuWallStart).Seconds()
+		report := map[string]interface{}{"replicas": nodeIDs, "sample_seconds": seconds}
+		if cpuStartErr != nil || cpuEndErr != nil {
+			report["cpu_seconds"] = nil
+			report["error"] = fmt.Sprintf("start=%v end=%v", cpuStartErr, cpuEndErr)
+		} else {
+			report["cpu_seconds"] = (cpuEnd - cpuStart).Seconds()
+			report["cpu_percent_one_core"] = 100 * (cpuEnd - cpuStart).Seconds() / seconds
+		}
+		diagnostics.PrintJSON("CPU", report)
+	}()
 	close(experimentStart)
 
 	var submittedTxCount int32
@@ -368,6 +391,9 @@ func runDistributedMode(rootCtx context.Context, nodeIDs []uint64, maliciousThre
 	}()
 
 	wg.Wait()
+	for _, id := range nodeIDs {
+		diagnostics.PrintJSON("MECHANISM", services[id].Benchmark.Report(id))
+	}
 	fmt.Println("\nAll nodes on this instance have shut down.")
 }
 

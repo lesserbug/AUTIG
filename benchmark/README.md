@@ -47,6 +47,43 @@ Logs are stored in `benchmark/logs` and parsed JSON results in
 `benchmark/results`. `fab destroy` permanently terminates all AWS instances
 tagged with the default testbed name `autig`.
 
+Every run now records compact `BENCHMARK MECHANISM` summaries and one
+`BENCHMARK CPU` record per process, without requiring `stage_timing` or
+`cpuprofile`. Rebuild/deploy the node binary as well as updating `fabfile.py`.
+The terminal hides per-replica state hashes, build lists and instance/IP
+metadata; the full result JSON and raw logs retain them for reproducibility
+and the existing final-state consistency check.
+
+The result's `mechanism` object reports fresh LO count/rate, retransmission
+attempt count/rate, actual LO signatures (including re-signing), mean fresh LO
+ID count (including empty orders), receipt-queue peak and cutoff lengths,
+leader committed fragments/rate, mean fragment output, and completed construct
+count/rate and wall time. Construct wall time includes lock waiting and is
+not CPU time. Queue observations are made on queue changes, not periodic
+samples; their raw `sum/count` must not be interpreted as a time average.
+
+`mechanism.network` separates `local_order`, other `protocol` messages and
+`transaction` fanout. Messages count successful remote Gob encodes; bytes count
+actual bytes accepted by socket writes, including partial failed writes but
+excluding handshakes, benchmark ready/start/finish, TCP/IP headers and TCP
+retransmissions. This is application-stream traffic, not packet capture.
+Self-delivery counts are retained separately in `mechanism_nodes` and excluded
+from remote traffic. Per-transaction costs use the leader's unique completed
+transactions, never the sum of replicated commits. Zero completions produce
+null normalized costs.
+
+Mechanism events are counted when recorded before each process's local fixed
+measurement deadline; post-cutoff draining is excluded. These are local Start
+windows, not globally synchronized WAN windows. An operation completing after
+the cutoff is excluded, including its duration/bytes. CPU uses Linux rusage or
+Windows process times, sampled around that same window; `cpu_processes` retains
+the actual sample duration and CPU percentage where 100% means one core.
+Remote runs use one process per replica, so leader/follower CPU can be compared
+by replica ID. A local multi-node run shares one process and its CPU cannot be
+attributed to individual replicas. Unsupported CPU sampling is null, not zero.
+CPU includes the workload generator on the leader. Use identical instrumentation
+settings and run lengths for both interval configurations.
+
 The fixed-leader benchmark waits for verification acknowledgements from
 `n-f` distinct replicas (including the constructing leader) before its adapter
 simulates commit. These acknowledgements are benchmark control messages, not a

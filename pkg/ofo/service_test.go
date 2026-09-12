@@ -311,6 +311,7 @@ func TestOmittedLocalOrderRetainsChunk(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	s.Benchmark.Begin(time.Now(), time.Now().Add(time.Minute))
 	for _, value := range []string{"x", "y"} {
 		b := []byte(value)
 		s.HandleMessage(network.Message{Payload: &types.Transaction{ID: types.TransactionID(b), CanonicalBytes: b}})
@@ -326,6 +327,11 @@ func TestOmittedLocalOrderRetainsChunk(t *testing.T) {
 	}
 	if !auth.VerifyReplica(1, types.LocalOrderDigest(sent[1]), sent[1].Signature) {
 		t.Fatal("invalid renewed signature")
+	}
+	s.GenerateAndSendLocalOrder() // Ordinary pending retransmission reuses that signature.
+	stats := s.Benchmark.Report(1)
+	if stats.Counts["lo_fresh"] != 1 || stats.Counts["lo_retransmit_attempts"] != 2 || stats.Counts["lo_signatures"] != 2 {
+		t.Fatalf("fresh/re-sign/retransmit accounting is incorrect: %+v", stats)
 	}
 }
 

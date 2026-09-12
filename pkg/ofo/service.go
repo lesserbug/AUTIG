@@ -30,6 +30,7 @@ type pendingCandidate struct {
 }
 
 type OFOService struct {
+	Benchmark   *diagnostics.Mechanism
 	ReplicaID   uint64
 	isLeader    bool
 	isMalicious bool
@@ -98,6 +99,7 @@ func NewOFOService(replicaID, n, f uint64, gamma float64, net network.NetworkInt
 		return nil, fmt.Errorf("authorized order leader %d is not a replica", authContext.LeaderID)
 	}
 	s := &OFOService{
+		Benchmark: &diagnostics.Mechanism{},
 		ReplicaID: replicaID, isLeader: replicaID == authContext.LeaderID, isMalicious: isMalicious,
 		network: net, auth: auth, admission: admission, authContext: authContext, onCandidate: onCandidate,
 		committed: NewEvidenceState(authContext.Epoch, n, genesis.StateID), latestCommittedFragment: genesis.FragmentDigest,
@@ -157,6 +159,7 @@ func (s *OFOService) HandleMessage(msg network.Message) {
 		if !s.observed[payload.ID] {
 			s.observed[payload.ID] = true
 			s.receiptQueue = append(s.receiptQueue, payload.ID)
+			s.Benchmark.Observe("receipt_queue", uint64(len(s.receiptQueue)))
 		}
 		if _, exists := s.txSubmissionTimes[payload.ID]; !exists {
 			s.txSubmissionTimes[payload.ID] = payload.SubmissionTime
@@ -176,6 +179,7 @@ func (s *OFOService) GenerateAndSendLocalOrder() {
 	s.rwMu.Lock()
 	if s.localOrderPending != nil {
 		s.localOrderRetransmits++
+		s.Benchmark.Count("lo_retransmit_attempts", 1)
 		order := cloneLocalOrder(s.localOrderPending)
 		if order.FragmentSeq != s.committed.FragmentSeq+1 || order.Epoch != s.authContext.Epoch {
 			order.FragmentSeq = s.committed.FragmentSeq + 1
@@ -187,6 +191,7 @@ func (s *OFOService) GenerateAndSendLocalOrder() {
 				return
 			}
 			order.Signature = signature
+			s.Benchmark.Count("lo_signatures", 1)
 			s.localOrderPending = cloneLocalOrder(order)
 		}
 		s.rwMu.Unlock()
@@ -216,6 +221,9 @@ func (s *OFOService) GenerateAndSendLocalOrder() {
 		return
 	}
 	order.Signature = signature
+	s.Benchmark.Count("lo_signatures", 1)
+	s.Benchmark.Count("lo_fresh", 1)
+	s.Benchmark.Observe("lo_fresh_ids", uint64(len(ids)))
 	s.localOrderPending = cloneLocalOrder(order)
 	s.localOrderFresh++
 	s.rwMu.Unlock()
@@ -347,6 +355,8 @@ func (s *OFOService) runProposerStage() {
 }
 
 func (s *OFOService) constructCandidate(orders []*types.LocalOrder) (*pendingCandidate, error) {
+	constructStart := time.Now()
+	defer func() { s.Benchmark.Observe("construct_wall_ns", uint64(time.Since(constructStart))) }()
 	span := diagnostics.Start("construct", s.ReplicaID, 0)
 	defer span.Finish()
 	s.rwMu.Lock()
@@ -417,6 +427,7 @@ func (s *OFOService) constructCandidate(orders []*types.LocalOrder) (*pendingCan
 	}
 	candidate := &pendingCandidate{digest: digest, preState: preState, postState: postState, manager: manager, fragment: fragment, done: make(chan struct{})}
 	s.pending = candidate
+	s.Benchmark.Count("construct_success", 1)
 	return candidate, nil
 }
 
@@ -517,9 +528,12 @@ func (s *OFOService) CommitPending(digest [32]byte) ([]types.FairnessBatch, bool
 	}
 	s.applyCommittedLocalOrder(candidate.fragment.Evidence)
 	finalizeTime := time.Now()
+	s.Benchmark.Count("committed_fragments", 1)
+	outputTransactions := uint64(0)
 	measured := s.MeasurementDeadline.IsZero() || finalizeTime.Before(s.MeasurementDeadline)
 	for _, batch := range candidate.fragment.FinalOrder.Batches {
 		for _, id := range batch.Transactions {
+			outputTransactions++
 			if measured {
 				s.measuredFinalized++
 			}
@@ -537,6 +551,7 @@ func (s *OFOService) CommitPending(digest [32]byte) ([]types.FairnessBatch, bool
 		}
 	}
 	batches := append([]types.FairnessBatch(nil), candidate.fragment.FinalOrder.Batches...)
+	s.Benchmark.Observe("fragment_output_transactions", outputTransactions)
 	s.pending = nil
 	close(candidate.done)
 	return batches, true
@@ -570,6 +585,7 @@ func (s *OFOService) applyCommittedLocalOrder(orders []*types.LocalOrder) {
 			}
 		}
 		s.receiptQueue = remaining
+		s.Benchmark.Observe("receipt_queue", uint64(len(s.receiptQueue)))
 		if s.localOrderPending != nil && types.LocalOrderDigest(s.localOrderPending) == types.LocalOrderDigest(order) {
 			s.localOrderPending = nil
 		}

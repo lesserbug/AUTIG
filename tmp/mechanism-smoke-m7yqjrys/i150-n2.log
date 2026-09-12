@@ -1,0 +1,20 @@
+2026/09/12 17:49:04 BENCHMARK BUILD revision=76b056d90f114266e89d889b49c4ca487d5d04fb modified=true go=go1.24.5
+2026/09/12 17:49:05 BENCHMARK DIAGNOSTICS stage_timing=false cpu_profile=false
+Starting UTIG-based nodes: [2]
+System params: N=5, F=1, Gamma=0.90
+Malicious replicas are assumed to be IDs >= 4
+Workload params: TxRate=100/s, TxSize=512B, LO-Interval=150ms, LO-Size=400
+Simulation duration: 4 seconds
+
+2026/09/12 17:49:05 Node 2 waiting for peers to connect...
+2026/09/12 17:49:09 Node 2: All peers connected.
+2026/09/12 17:49:09 Node 2 is starting as an HONEST replica.
+2026/09/12 17:49:09 Follower monitor started.
+[FOLLOWERS] Node 2: {Finalized: 194} 
+Follower monitor shutting down.
+2026/09/12 17:49:13 BENCHMARK CPU {"cpu_percent_one_core":2.7345427641985833,"cpu_seconds":0.109375,"replicas":[2],"sample_seconds":3.9997546}
+2026/09/12 17:49:13 BENCHMARK STATE replica=2 seq=26 state=d002a9401a9da4387c97aa16d1e946aaa1c466d6187b9ef9180a69237438e475 fragment=ecf57f3b2b93ee61699f8214288277399b5059e28c946ce61a7bf139527e3fdf
+2026/09/12 17:49:13 Node 2 shutting down...
+2026/09/12 17:49:13 BENCHMARK MECHANISM {"replica":2,"window_seconds":4,"counts":{"committed_fragments":26,"lo_fresh":21,"lo_retransmit_attempts":5,"lo_signatures":26,"network_local_order_bytes":28789,"network_local_order_messages":26,"network_protocol_bytes":2791,"network_protocol_messages":26},"samples":{"fragment_output_transactions":{"count":26,"sum":389,"max":16,"last":15},"lo_fresh_ids":{"count":21,"sum":390,"max":30,"last":16},"receipt_queue":{"count":420,"sum":5744,"max":31,"last":9}}}
+
+All nodes on this instance have shut down.

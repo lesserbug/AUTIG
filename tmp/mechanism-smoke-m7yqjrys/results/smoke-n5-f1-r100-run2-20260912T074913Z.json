@@ -1,0 +1,338 @@
+{
+  "mode": "smoke",
+  "timestamp": "2026-09-12T07:49:13.090230+00:00",
+  "run": 2,
+  "nodes": 5,
+  "faults": 1,
+  "gamma": 0.9,
+  "lo_interval": 150,
+  "lo_size": 400,
+  "rate": 100,
+  "tx_size": 512,
+  "duration": 4,
+  "offered_rate_tolerance": 0.02,
+  "git_commit": "76b056d90f114266e89d889b49c4ca487d5d04fb",
+  "git_modified": true,
+  "go_version": "go1.24.5",
+  "mechanism_nodes": {
+    "0": {
+      "replica": 0,
+      "window_seconds": 4,
+      "counts": {
+        "committed_fragments": 26,
+        "construct_success": 26,
+        "lo_fresh": 21,
+        "lo_retransmit_attempts": 5,
+        "lo_signatures": 26,
+        "network_protocol_bytes": 677180,
+        "network_protocol_messages": 208,
+        "network_transaction_bytes": 1006164,
+        "network_transaction_messages": 1596,
+        "self_local_order_bytes": 0,
+        "self_local_order_messages": 26,
+        "self_transaction_bytes": 0,
+        "self_transaction_messages": 399
+      },
+      "samples": {
+        "construct_wall_ns": {
+          "count": 26,
+          "sum": 32496100,
+          "max": 1991100,
+          "last": 1064400
+        },
+        "fragment_output_transactions": {
+          "count": 26,
+          "sum": 389,
+          "max": 16,
+          "last": 15
+        },
+        "lo_fresh_ids": {
+          "count": 21,
+          "sum": 389,
+          "max": 30,
+          "last": 15
+        },
+        "receipt_queue": {
+          "count": 419,
+          "sum": 6014,
+          "max": 31,
+          "last": 25
+        }
+      }
+    },
+    "1": {
+      "replica": 1,
+      "window_seconds": 4,
+      "counts": {
+        "committed_fragments": 26,
+        "lo_fresh": 21,
+        "lo_retransmit_attempts": 5,
+        "lo_signatures": 26,
+        "network_local_order_bytes": 28929,
+        "network_local_order_messages": 26,
+        "network_protocol_bytes": 2791,
+        "network_protocol_messages": 26
+      },
+      "samples": {
+        "fragment_output_transactions": {
+          "count": 26,
+          "sum": 389,
+          "max": 16,
+          "last": 15
+        },
+        "lo_fresh_ids": {
+          "count": 21,
+          "sum": 389,
+          "max": 31,
+          "last": 15
+        },
+        "receipt_queue": {
+          "count": 420,
+          "sum": 5769,
+          "max": 31,
+          "last": 10
+        }
+      }
+    },
+    "2": {
+      "replica": 2,
+      "window_seconds": 4,
+      "counts": {
+        "committed_fragments": 26,
+        "lo_fresh": 21,
+        "lo_retransmit_attempts": 5,
+        "lo_signatures": 26,
+        "network_local_order_bytes": 28789,
+        "network_local_order_messages": 26,
+        "network_protocol_bytes": 2791,
+        "network_protocol_messages": 26
+      },
+      "samples": {
+        "fragment_output_transactions": {
+          "count": 26,
+          "sum": 389,
+          "max": 16,
+          "last": 15
+        },
+        "lo_fresh_ids": {
+          "count": 21,
+          "sum": 390,
+          "max": 30,
+          "last": 16
+        },
+        "receipt_queue": {
+          "count": 420,
+          "sum": 5744,
+          "max": 31,
+          "last": 9
+        }
+      }
+    },
+    "3": {
+      "replica": 3,
+      "window_seconds": 4,
+      "counts": {
+        "committed_fragments": 26,
+        "lo_fresh": 21,
+        "lo_retransmit_attempts": 5,
+        "lo_signatures": 26,
+        "network_local_order_bytes": 28745,
+        "network_local_order_messages": 26,
+        "network_protocol_bytes": 2791,
+        "network_protocol_messages": 26
+      },
+      "samples": {
+        "fragment_output_transactions": {
+          "count": 26,
+          "sum": 389,
+          "max": 16,
+          "last": 15
+        },
+        "lo_fresh_ids": {
+          "count": 21,
+          "sum": 389,
+          "max": 30,
+          "last": 30
+        },
+        "receipt_queue": {
+          "count": 420,
+          "sum": 5832,
+          "max": 31,
+          "last": 10
+        }
+      }
+    },
+    "4": {
+      "replica": 4,
+      "window_seconds": 4,
+      "counts": {
+        "committed_fragments": 26,
+        "lo_fresh": 21,
+        "lo_retransmit_attempts": 5,
+        "lo_signatures": 26,
+        "network_local_order_bytes": 28122,
+        "network_local_order_messages": 26,
+        "network_protocol_bytes": 2791,
+        "network_protocol_messages": 26
+      },
+      "samples": {
+        "fragment_output_transactions": {
+          "count": 26,
+          "sum": 389,
+          "max": 16,
+          "last": 15
+        },
+        "lo_fresh_ids": {
+          "count": 21,
+          "sum": 374,
+          "max": 31,
+          "last": 15
+        },
+        "receipt_queue": {
+          "count": 420,
+          "sum": 5646,
+          "max": 31,
+          "last": 25
+        }
+      }
+    }
+  },
+  "cpu_processes": [
+    {
+      "cpu_percent_one_core": 7.422330359967583,
+      "cpu_seconds": 0.296875,
+      "replicas": [
+        0
+      ],
+      "sample_seconds": 3.9997546
+    },
+    {
+      "cpu_percent_one_core": 3.124714401103739,
+      "cpu_seconds": 0.125,
+      "replicas": [
+        1
+      ],
+      "sample_seconds": 4.0003656
+    },
+    {
+      "cpu_percent_one_core": 2.7345427641985833,
+      "cpu_seconds": 0.109375,
+      "replicas": [
+        2
+      ],
+      "sample_seconds": 3.9997546
+    },
+    {
+      "cpu_percent_one_core": 3.515381296191642,
+      "cpu_seconds": 0.140625,
+      "replicas": [
+        3
+      ],
+      "sample_seconds": 4.0002773
+    },
+    {
+      "cpu_percent_one_core": 3.515381296191642,
+      "cpu_seconds": 0.140625,
+      "replicas": [
+        4
+      ],
+      "sample_seconds": 4.0002773
+    }
+  ],
+  "measurement_duration_ms": 4000.0,
+  "submitted": 399,
+  "finalized": 389,
+  "average_tps": 97.25,
+  "actual_offered_rate": 99.75,
+  "locally_failed_transaction_send_attempts": 0,
+  "mean_completed_transaction_latency_ms": 83.0,
+  "latency_samples": 389,
+  "outstanding": 10,
+  "completion_ratio": 0.974937,
+  "locally_failed_local_order_send_attempts": 0,
+  "locally_failed_autig_candidate_send_attempts": 0,
+  "locally_failed_benchmark_commit_send_attempts": 0,
+  "replica_states": {
+    "0": [
+      "26",
+      "d002a9401a9da4387c97aa16d1e946aaa1c466d6187b9ef9180a69237438e475",
+      "ecf57f3b2b93ee61699f8214288277399b5059e28c946ce61a7bf139527e3fdf"
+    ],
+    "1": [
+      "26",
+      "d002a9401a9da4387c97aa16d1e946aaa1c466d6187b9ef9180a69237438e475",
+      "ecf57f3b2b93ee61699f8214288277399b5059e28c946ce61a7bf139527e3fdf"
+    ],
+    "2": [
+      "26",
+      "d002a9401a9da4387c97aa16d1e946aaa1c466d6187b9ef9180a69237438e475",
+      "ecf57f3b2b93ee61699f8214288277399b5059e28c946ce61a7bf139527e3fdf"
+    ],
+    "3": [
+      "26",
+      "d002a9401a9da4387c97aa16d1e946aaa1c466d6187b9ef9180a69237438e475",
+      "ecf57f3b2b93ee61699f8214288277399b5059e28c946ce61a7bf139527e3fdf"
+    ],
+    "4": [
+      "26",
+      "d002a9401a9da4387c97aa16d1e946aaa1c466d6187b9ef9180a69237438e475",
+      "ecf57f3b2b93ee61699f8214288277399b5059e28c946ce61a7bf139527e3fdf"
+    ]
+  },
+  "configured_offered_rate": 100,
+  "offered_rate_relative_deviation": 0.0025,
+  "offered_rate_within_tolerance": true,
+  "mechanism": {
+    "lo_fresh": 105,
+    "lo_fresh_per_second": 26.25,
+    "lo_retransmit_attempts": 25,
+    "lo_retransmit_attempts_per_second": 6.25,
+    "lo_signatures": 130,
+    "lo_signatures_per_second": 32.5,
+    "lo_fresh_ids_mean": 18.39047619047619,
+    "receipt_queue_peak": 31,
+    "receipt_queue_at_cutoff": {
+      "0": 25,
+      "1": 10,
+      "2": 9,
+      "3": 10,
+      "4": 25
+    },
+    "committed_fragments": 26,
+    "committed_fragments_per_second": 6.5,
+    "fragment_output_tx_mean": 14.961538461538462,
+    "construct_completed": 26,
+    "construct_per_second": 6.5,
+    "construct_success": 26,
+    "construct_wall_total_ms": 32.4961,
+    "construct_wall_mean_ms": 1.24985,
+    "network": {
+      "local_order": {
+        "messages": 104,
+        "messages_per_second": 26.0,
+        "bytes": 114585,
+        "bytes_per_second": 28646.25,
+        "bytes_per_committed_tx": 294.5629820051414,
+        "failed_sends": 0
+      },
+      "protocol": {
+        "messages": 312,
+        "messages_per_second": 78.0,
+        "bytes": 688344,
+        "bytes_per_second": 172086.0,
+        "bytes_per_committed_tx": 1769.521850899743,
+        "failed_sends": 0
+      },
+      "transaction": {
+        "messages": 1596,
+        "messages_per_second": 399.0,
+        "bytes": 1006164,
+        "bytes_per_second": 251541.0,
+        "bytes_per_committed_tx": 2586.5398457583547,
+        "failed_sends": 0
+      }
+    },
+    "cpu_seconds": 0.8125,
+    "cpu_ms_per_committed_tx": 2.088688946015424
+  }
+}

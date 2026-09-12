@@ -1,6 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from json import dump, dumps, load
+from json import dump, dumps, load, loads
 from math import ceil
 from pathlib import Path
 import os
@@ -145,6 +145,79 @@ def _parse_build(text):
     }
 
 
+def _parse_mechanism(text):
+    nodes = {}
+    for raw in re.findall(r"BENCHMARK MECHANISM (\{[^\n]+\})", text):
+        record = loads(raw)
+        key = str(record["replica"])
+        if key in nodes:
+            raise RuntimeError(f"duplicate mechanism report for replica {key}")
+        nodes[key] = record
+    return {
+        "mechanism_nodes": nodes,
+        "cpu_processes": [loads(raw) for raw in re.findall(r"BENCHMARK CPU (\{[^\n]+\})", text)],
+    }
+
+
+def _mechanism_summary(metrics, nodes):
+    reports = metrics.get("mechanism_nodes", {})
+    if not reports:  # Preserve support for old benchmark logs.
+        return None
+    if set(reports) != {str(i) for i in range(nodes)}:
+        raise RuntimeError("missing replica mechanism reports")
+    if any(r["window_seconds"] <= 0 for r in reports.values()):
+        raise RuntimeError("invalid mechanism measurement window")
+    def count(name):
+        return sum(r["counts"].get(name, 0) for r in reports.values())
+    def rate(name):
+        return sum(r["counts"].get(name, 0) / r["window_seconds"] for r in reports.values())
+    def sample(name, key):
+        return sum(r["samples"].get(name, {}).get(key, 0) for r in reports.values())
+    def ratio(a, b):
+        return a / b if b else None
+    leader = reports["0"]  # The harness explicitly configures leader_id=0.
+    construct = leader["samples"].get("construct_wall_ns", {})
+    fragments = leader["counts"].get("committed_fragments", 0)
+    traffic = {}
+    for kind in ("local_order", "protocol", "transaction"):
+        prefix = "network_" + kind
+        traffic[kind] = {
+            "messages": count(prefix + "_messages"),
+            "messages_per_second": rate(prefix + "_messages"),
+            "bytes": count(prefix + "_bytes"),
+            "bytes_per_second": rate(prefix + "_bytes"),
+            "bytes_per_committed_tx": ratio(count(prefix + "_bytes"), metrics["finalized"]),
+            "failed_sends": count(prefix + "_failures"),
+        }
+    cpu = metrics.get("cpu_processes", [])
+    cpu_ids = [str(i) for p in cpu for i in p["replicas"]]
+    if sorted(cpu_ids) != sorted(reports):
+        raise RuntimeError("missing or duplicate process CPU reports")
+    cpu_seconds = None if any(p.get("cpu_seconds") is None for p in cpu) else sum(p["cpu_seconds"] for p in cpu)
+    return {
+        "lo_fresh": count("lo_fresh"),
+        "lo_fresh_per_second": rate("lo_fresh"),
+        "lo_retransmit_attempts": count("lo_retransmit_attempts"),
+        "lo_retransmit_attempts_per_second": rate("lo_retransmit_attempts"),
+        "lo_signatures": count("lo_signatures"),
+        "lo_signatures_per_second": rate("lo_signatures"),
+        "lo_fresh_ids_mean": ratio(sample("lo_fresh_ids", "sum"), sample("lo_fresh_ids", "count")),
+        "receipt_queue_peak": max(r["samples"].get("receipt_queue", {}).get("max", 0) for r in reports.values()),
+        "receipt_queue_at_cutoff": {i: r["samples"].get("receipt_queue", {}).get("last", 0) for i, r in reports.items()},
+        "committed_fragments": fragments,
+        "committed_fragments_per_second": fragments / leader["window_seconds"],
+        "fragment_output_tx_mean": ratio(leader["samples"].get("fragment_output_transactions", {}).get("sum", 0), fragments),
+        "construct_completed": construct.get("count", 0),
+        "construct_per_second": construct.get("count", 0) / leader["window_seconds"],
+        "construct_success": leader["counts"].get("construct_success", 0),
+        "construct_wall_total_ms": construct.get("sum", 0) / 1e6,
+        "construct_wall_mean_ms": ratio(construct.get("sum", 0) / 1e6, construct.get("count", 0)),
+        "network": traffic,
+        "cpu_seconds": cpu_seconds,
+        "cpu_ms_per_committed_tx": ratio(cpu_seconds * 1000, metrics["finalized"]) if cpu_seconds is not None else None,
+    }
+
+
 def _parse_log(path):
     text = Path(path).read_text(encoding="utf-8", errors="replace")
     if any(marker in text for marker in ("Verification FAILED", "BENCHMARK INVALID", "Order leader rejected", "panic:")):
@@ -167,6 +240,7 @@ def _parse_log(path):
         raise RuntimeError(f"{path} is missing final metrics: {', '.join(missing)}")
     metrics = {
         **_parse_build(text),
+        **_parse_mechanism(text),
         "measurement_duration_ms": _duration_ms(matches["measurement_duration"].group(1)),
         "submitted": int(matches["submitted"].group(1)),
         "finalized": int(matches["finalized"].group(1)),
@@ -212,6 +286,9 @@ def _write_result(mode, parameters, run, metrics):
     metrics["offered_rate_relative_deviation"] = relative_deviation
     metrics["offered_rate_tolerance"] = tolerance
     metrics["offered_rate_within_tolerance"] = rate_within_tolerance
+    mechanism = _mechanism_summary(metrics, parameters["nodes"])
+    if mechanism is not None:
+        metrics["mechanism"] = mechanism
     if metrics["locally_failed_transaction_send_attempts"] != 0:
         raise RuntimeError(
             f"benchmark reports {metrics['locally_failed_transaction_send_attempts']} "
@@ -248,7 +325,10 @@ def _write_result(mode, parameters, run, metrics):
             "use actual_offered_rate for load plots and inspect generator capacity.",
             file=sys.stderr,
         )
-    print(dumps(result, indent=2))
+    # Keep reproducibility and state-validation data in JSON, without flooding the console.
+    hidden = {"replica_states", "replica_builds", "replica_instances", "ip_mode", "mechanism_nodes"}
+    print(dumps({key: value for key, value in result.items() if key not in hidden}, indent=2))
+    print(f"Result saved: {RESULT_DIR / filename}")
 
 
 def _aws_records(settings, states=("running",)):
@@ -453,6 +533,8 @@ def _run_remote_once(records, settings, parameters, run):
     metrics = _parse_log(leader_log)
     metrics["ip_mode"] = "public"  # Actual transport configuration below.
     metrics["replica_builds"] = {}
+    metrics["mechanism_nodes"] = {}
+    metrics["cpu_processes"] = []
     metrics["replica_instances"] = {str(i): record for i, record in enumerate(records)}
     metrics["locally_failed_local_order_send_attempts"] = 0
     metrics["locally_failed_autig_candidate_send_attempts"] = 0
@@ -464,6 +546,11 @@ def _run_remote_once(records, settings, parameters, run):
         )
         text = path.read_text(encoding="utf-8", errors="replace")
         metrics["replica_builds"][str(replica_id)] = _parse_build(text)
+        mechanism = _parse_mechanism(text)
+        if set(metrics["mechanism_nodes"]) & set(mechanism["mechanism_nodes"]):
+            raise RuntimeError("duplicate replica mechanism reports across logs")
+        metrics["mechanism_nodes"].update(mechanism["mechanism_nodes"])
+        metrics["cpu_processes"].extend(mechanism["cpu_processes"])
         if any(marker in text for marker in ("Verification FAILED", "BENCHMARK INVALID", "Order leader rejected", "panic:")):
             raise RuntimeError(f"{path} reports a failed benchmark")
         metrics["replica_states"].update({

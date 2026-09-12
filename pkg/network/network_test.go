@@ -1,6 +1,7 @@
 package network
 
 import (
+	"SpeedFair_simplify/pkg/diagnostics"
 	"net"
 	"strings"
 	"testing"
@@ -77,6 +78,10 @@ func TestFiveNodeMeshAndReconnect(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	for _, n := range nodes {
+		n.Benchmark = &diagnostics.Mechanism{}
+		n.Benchmark.Begin(time.Now(), time.Now().Add(time.Minute))
+	}
 	assertDelivery := func() {
 		t.Helper()
 		for from, n := range nodes {
@@ -104,6 +109,12 @@ func TestFiveNodeMeshAndReconnect(t *testing.T) {
 		}
 	}
 	assertDelivery()
+	for _, n := range nodes {
+		stats := n.Benchmark.Report(n.config.ReplicaID)
+		if stats.Counts["network_protocol_messages"] != 4 || stats.Counts["network_protocol_bytes"] == 0 {
+			t.Fatalf("missing real Gob stream accounting: %+v", stats)
+		}
+	}
 
 	// Verify both endpoints reference the same stream, owned by the lower ID.
 	for low := range nodes {
