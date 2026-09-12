@@ -50,12 +50,14 @@ const (
 func main() {
 	// --- 1. 添加新的命令行标志，并使用常量作为默认值 ---
 	var (
-		configFile  = flag.String("config", "config.json", "JSON config file for node addresses")
-		nodeList    = flag.String("nodes", "", "Comma-separated list of node IDs to run on this instance")
-		cpuProfile  = flag.Bool("cpuprofile", false, "Enable CPU profiling for this instance")
-		stageTiming = flag.Bool("stage-timing", false, "Log per-fragment benchmark stage timing")
-		faultCount  = flag.Uint64("f", 2, "Number of tolerated faulty replicas")
-		gamma       = flag.Float64("gamma", 0.90, "Fairness parameter gamma")
+		configFile       = flag.String("config", "config.json", "JSON config file for node addresses")
+		nodeList         = flag.String("nodes", "", "Comma-separated list of node IDs to run on this instance")
+		cpuProfile       = flag.Bool("cpuprofile", false, "Enable CPU profiling for this instance")
+		stageTiming      = flag.Bool("stage-timing", false, "Log per-fragment benchmark stage timing")
+		faultCount       = flag.Uint64("f", 2, "Number of tolerated faulty replicas")
+		byzantineCount   = flag.Int64("byzantine-count", -1, "Actual malicious LO producers (default: f; must be between 0 and f)")
+		byzantineLODelay = flag.Duration("byzantine-lo-delay", 0, "Extra wait before each malicious LO generation/send attempt, e.g. 200ms")
+		gamma            = flag.Float64("gamma", 0.90, "Fairness parameter gamma")
 
 		// <<< 新增的标志，用于控制批次大小 >>>
 		loInterval  = flag.Int("lo-interval", LO_GENERATION_INTERVAL_MS_DEFAULT, "Interval in milliseconds for generating local orders")
@@ -111,12 +113,17 @@ func main() {
 		log.Fatalf("Failed to configure AUTIG genesis: %v", err)
 	}
 
-	maliciousThresholdID := totalNodesFromConfig - *faultCount
+	actualByzantine, err := resolveByzantineCount(totalNodesFromConfig, *faultCount, *byzantineCount, *byzantineLODelay)
+	if err != nil {
+		log.Fatalf("Invalid benchmark fault configuration: %v", err)
+	}
+	maliciousThresholdID := totalNodesFromConfig - actualByzantine
 
 	// 打印时，确保使用从配置文件中读取到的总节点数
 	fmt.Printf("Starting UTIG-based nodes: %v\n", nodesToRun)
 	// <<< 修正点: 使用 totalNodesFromConfig >>>
 	fmt.Printf("System params: N=%d, F=%d, Gamma=%.2f\n", totalNodesFromConfig, *faultCount, *gamma)
+	fmt.Printf("BENCHMARK FAULTS tolerated=%d byzantine=%d lo_delay=%s behavior=reverse\n", *faultCount, actualByzantine, *byzantineLODelay)
 	fmt.Printf("Malicious replicas are assumed to be IDs >= %d\n", maliciousThresholdID) // 打印提示信息
 	fmt.Printf("Workload params: TxRate=%d/s, TxSize=%dB, LO-Interval=%dms, LO-Size=%d\n", *txRate, *txSize, *loInterval, *loSize)
 	fmt.Printf("Simulation duration: %d seconds\n\n", *simDuration)
@@ -136,11 +143,11 @@ func main() {
 	}()
 
 	// The experiment timeout starts only after every replica handler is ready.
-	runDistributedMode(ctx, nodesToRun, maliciousThresholdID, config, totalNodesFromConfig, *faultCount, *gamma, *loInterval, *loSize, *txRate, *txSize, *simDuration, authenticator, authContext, genesis)
+	runDistributedMode(ctx, nodesToRun, maliciousThresholdID, config, totalNodesFromConfig, *faultCount, *gamma, *loInterval, *loSize, *txRate, *txSize, *simDuration, authenticator, authContext, genesis, *byzantineLODelay)
 }
 
 // <<< MODIFIED: 函数签名接收 maliciousThresholdID >>>
-func runDistributedMode(rootCtx context.Context, nodeIDs []uint64, maliciousThresholdID uint64, config map[uint64]string, totalNodes, faultCount uint64, gamma float64, loIntervalMs, loSize, txRate, txSize, simDuration int, authenticator types.Authenticator, authContext types.AuthContext, genesis types.ProtocolGenesis) {
+func runDistributedMode(rootCtx context.Context, nodeIDs []uint64, maliciousThresholdID uint64, config map[uint64]string, totalNodes, faultCount uint64, gamma float64, loIntervalMs, loSize, txRate, txSize, simDuration int, authenticator types.Authenticator, authContext types.AuthContext, genesis types.ProtocolGenesis, byzantineLODelay time.Duration) {
 	ctx, cancel := context.WithCancel(rootCtx)
 	defer cancel()
 
@@ -278,6 +285,13 @@ func runDistributedMode(rootCtx context.Context, nodeIDs []uint64, maliciousThre
 				case <-loGenTicker.C:
 					if loCtx.Err() != nil {
 						break loGenLoop
+					}
+					if isMalicious && byzantineLODelay > 0 {
+						service.Benchmark.Count("byzantine_lo_delay_attempts", 1)
+						if !waitForLocalOrder(loCtx, adapter.finished, byzantineLODelay) {
+							break loGenLoop
+						}
+						service.Benchmark.Count("byzantine_lo_delay_completed", 1)
 					}
 					service.GenerateAndSendLocalOrder()
 				case <-loCtx.Done():

@@ -96,6 +96,16 @@ class OfferedRateResultTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "rebuild/deploy"):
             self.write_result()
 
+    def test_saved_fault_metadata_resolves_default_and_preserves_zero(self):
+        result, _ = self.write_result()
+        self.assertEqual(result["byzantine_count"], 1)
+        self.assertEqual(result["byzantine_lo_delay_ms"], 0)
+        self.parameters.update(byzantine_count=0, byzantine_lo_delay_ms=200)
+        result, _ = self.write_result()
+        self.assertEqual(result["faults"], 1)
+        self.assertEqual(result["byzantine_count"], 0)
+        self.assertEqual(result["byzantine_lo_delay_ms"], 200)
+
 
 class DiagnosticMetadataTests(unittest.TestCase):
     def test_build_identity_is_from_binary_log_and_unknown_is_explicit(self):
@@ -112,6 +122,41 @@ class DiagnosticMetadataTests(unittest.TestCase):
         parameters.update(stage_timing=True, cpuprofile=True)
         enabled = fabfile._command(parameters, [0], binary="autig")
         self.assertEqual(enabled, command + ["-stage-timing", "-cpuprofile"])
+
+
+class ByzantineConfigurationTests(unittest.TestCase):
+    def parameters(self, **changes):
+        return dict(nodes=10, faults=2, gamma=1, lo_interval=150, lo_size=200,
+                    rate=700, tx_size=512, duration=5, **changes)
+
+    def test_legacy_default_and_independent_actual_count(self):
+        parameters = self.parameters()
+        self.assertEqual(fabfile._fault_parameters(parameters),
+                         dict(byzantine_count=2, byzantine_lo_delay_ms=0))
+        for count in [0, 1, 2]:
+            parameters.update(byzantine_count=count, byzantine_lo_delay_ms=200)
+            fabfile._validate_parameters(parameters)
+            command = fabfile._command(parameters, [9], binary="autig")
+            self.assertEqual(command[command.index("-f") + 1], "2")
+            self.assertEqual(command[command.index("-byzantine-count") + 1], str(count))
+            self.assertEqual(command[command.index("-byzantine-lo-delay") + 1], "200ms")
+
+    def test_rejects_invalid_counts_delays_and_f3_at_n10(self):
+        for count in [-1, 3, 0.5, True]:
+            with self.subTest(count=count), self.assertRaisesRegex(RuntimeError, "byzantine_count"):
+                fabfile._validate_parameters(self.parameters(byzantine_count=count))
+        for delay in [-1, 0.5, True, 2**63]:
+            with self.subTest(delay=delay), self.assertRaisesRegex(RuntimeError, "byzantine_lo_delay_ms"):
+                fabfile._validate_parameters(self.parameters(byzantine_lo_delay_ms=delay))
+        parameters = self.parameters()
+        parameters["faults"] = 3
+        with self.assertRaisesRegex(RuntimeError, "ceil"):
+            fabfile._validate_parameters(parameters)
+
+    def test_fault_cases_have_distinct_log_names(self):
+        names = {fabfile._remote_log_prefix(self.parameters(byzantine_count=b, byzantine_lo_delay_ms=d), 1)
+                 for b in [0, 1, 2] for d in [0, 200]}
+        self.assertEqual(len(names), 6)
 
 
 class MechanismTests(unittest.TestCase):
@@ -164,6 +209,18 @@ class MechanismTests(unittest.TestCase):
         self.assertEqual(parsed["cpu_processes"], records["cpu_processes"])
         with self.assertRaisesRegex(RuntimeError, "duplicate"):
             fabfile._parse_mechanism(text + "\n" + text)
+
+    def test_fault_logs_are_grouped_once_with_all_replicas(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parameters = dict(nodes=2, faults=0, rate=100, byzantine_count=0, byzantine_lo_delay_ms=200)
+            paths = [Path(directory) / f"{fabfile._remote_log_prefix(parameters, 1)}-node{i}.log" for i in range(2)]
+            for path in paths:
+                path.touch()
+            with patch.object(fabfile, "LOG_DIR", Path(directory)), \
+                    patch.object(fabfile, "_parse_run_logs", return_value=self.records()) as parse, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                fabfile.logs.body(None)
+            parse.assert_called_once_with(paths)
 
     def test_logs_recovers_all_replicas_and_hides_state(self):
         records = self.records()

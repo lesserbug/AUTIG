@@ -140,6 +140,7 @@ func TestServiceRejectsUnsafeProtocolParameters(t *testing.T) {
 		{name: "f not below n", n: 1, f: 1, gamma: 1},
 		{name: "gamma at one half", n: 5, f: 1, gamma: 0.5},
 		{name: "insufficient honest-quorum overlap", n: 4, f: 1, gamma: 1},
+		{name: "ten nodes cannot tolerate three even at gamma one", n: 10, f: 3, gamma: 1},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

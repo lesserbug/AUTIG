@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from json import dump, dumps, load, loads
+from itertools import product
 from math import ceil
 from pathlib import Path
 import hashlib
@@ -82,6 +83,25 @@ def _validate_parameters(parameters):
         raise RuntimeError("parameters violate 2*ceil(gamma*(n-f)) >= n+2f+1")
     if parameters["tx_size"] < 16:
         raise RuntimeError("tx_size must be at least 16 bytes")
+    _fault_parameters(parameters)
+
+
+def _fault_parameters(parameters):
+    count = parameters.get("byzantine_count")
+    if count is None:
+        count = parameters["faults"]
+    delay = parameters.get("byzantine_lo_delay_ms", 0)
+    if type(count) is not int or not 0 <= count <= parameters["faults"]:
+        raise RuntimeError("byzantine_count must be an integer between 0 and faults (or None to use faults)")
+    if type(delay) is not int or not 0 <= delay <= (2**63 - 1) // 1000000:
+        raise RuntimeError("byzantine_lo_delay_ms must be a nonnegative integer representable as a Go duration")
+    return {"byzantine_count": count, "byzantine_lo_delay_ms": delay}
+
+
+def _remote_log_prefix(parameters, run):
+    faults = _fault_parameters(parameters)
+    return (f"remote-n{parameters['nodes']}-r{parameters['rate']}-f{parameters['faults']}"
+            f"-b{faults['byzantine_count']}-d{faults['byzantine_lo_delay_ms']}-run{run}")
 
 
 def _prepare_runtime(nodes, addresses):
@@ -115,11 +135,14 @@ def _prepare_runtime(nodes, addresses):
 def _command(parameters, node_ids, config="config.json", binary=None):
     binary = str(binary or _binary("autig"))
     ids = ",".join(str(i) for i in node_ids)
+    faults = _fault_parameters(parameters)
     command = [
         binary,
         "-config", config,
         "-nodes", ids,
         "-f", str(parameters["faults"]),
+        "-byzantine-count", str(faults["byzantine_count"]),
+        "-byzantine-lo-delay", str(faults["byzantine_lo_delay_ms"]) + "ms",
         "-gamma", str(parameters["gamma"]),
         "-lo-interval", str(parameters["lo_interval"]),
         "-lo-size", str(parameters["lo_size"]),
@@ -357,16 +380,19 @@ def _write_result(mode, parameters, run, metrics):
             raise RuntimeError(f"benchmark reports {metrics[key]} {key}")
     RESULT_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc)
+    faults = _fault_parameters(parameters)
     result = {
         "mode": mode,
         "timestamp": timestamp.isoformat(),
         **_controller_identity(),
         "run": run,
         **parameters,
+        **faults,
         **metrics,
     }
     filename = (
         f"{mode}-n{parameters['nodes']}-f{parameters['faults']}"
+        f"-b{faults['byzantine_count']}-d{faults['byzantine_lo_delay_ms']}"
         f"-r{parameters['rate']}-run{run}-{timestamp.strftime('%Y%m%dT%H%M%SZ')}.json"
     )
     with (RESULT_DIR / filename).open("w", encoding="utf-8") as target:
@@ -559,10 +585,7 @@ def _run_remote_once(records, settings, parameters, run):
 
     def download(replica_id, record):
         connection = _connection(record, settings)
-        local = LOG_DIR / (
-            f"remote-n{parameters['nodes']}-r{parameters['rate']}"
-            f"-run{run}-node{replica_id}.log"
-        )
+        local = LOG_DIR / f"{_remote_log_prefix(parameters, run)}-node{replica_id}.log"
         connection.get(f"{name}/.benchmark/node.log", local=str(local))
         if parameters.get("cpuprofile", False) and exited:
             connection.get(
@@ -581,7 +604,7 @@ def _run_remote_once(records, settings, parameters, run):
 
         _parallel(records, cleanup)
         raise RuntimeError("remote AUTIG did not exit before the benchmark timeout; logs were downloaded")
-    paths = [LOG_DIR / f"remote-n{parameters['nodes']}-r{parameters['rate']}-run{run}-node{i}.log"
+    paths = [LOG_DIR / f"{_remote_log_prefix(parameters, run)}-node{i}.log"
              for i in range(parameters["nodes"])]
     metrics = _parse_run_logs(paths)
     metrics["ip_mode"] = "public"  # Actual transport configuration below.
@@ -596,6 +619,8 @@ def local(ctx):
     parameters = {
         "nodes": 5,
         "faults": 1,
+        "byzantine_count": None,  # None preserves the previous b=f behavior.
+        "byzantine_lo_delay_ms": 0,
         "gamma": 0.90,
         "rate": 700,
         "tx_size": 512,
@@ -612,7 +637,7 @@ def local(ctx):
     addresses = [f"127.0.0.1:{settings['port'] + i}" for i in range(parameters["nodes"])]
     _prepare_runtime(parameters["nodes"], addresses)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    log = LOG_DIR / "local.log"
+    log = LOG_DIR / (_remote_log_prefix(parameters, 1).replace("remote-", "local-", 1) + ".log")
     with log.open("w", encoding="utf-8") as output:
         completed = subprocess.run(
             _command(parameters, range(parameters["nodes"])),
@@ -633,6 +658,8 @@ def remote(ctx):
     print("BENCHMARK CONTROLLER " + dumps(_controller_identity()))
     matrix = {
         "faults": 1,
+        "byzantine_count": [None],  # e.g. [0, 1, 2] with fixed faults=2, nodes=[10].
+        "byzantine_lo_delay_ms": 0,  # Same per-node delay at every b; zero disables it.
         "nodes": [5],
         "rate": [700],
         "gamma": 0.90,
@@ -645,6 +672,8 @@ def remote(ctx):
         "stage_timing": False,
         "cpuprofile": False,
     }
+    for nodes, rate, count in product(matrix["nodes"], matrix["rate"], matrix["byzantine_count"]):
+        _validate_parameters({**matrix, "nodes": nodes, "rate": rate, "byzantine_count": count})
     settings = _settings()
     _require_repo(settings)
     available = _spread(
@@ -661,10 +690,12 @@ def remote(ctx):
         addresses = [f"{record['public']}:{settings['port']}" for record in records]
         _prepare_runtime(nodes, addresses)
         _upload_remote(records, settings, nodes)
-        for rate in matrix["rate"]:
+        for rate, byzantine_count in product(matrix["rate"], matrix["byzantine_count"]):
             parameters = {
                 "nodes": nodes,
                 "faults": matrix["faults"],
+                "byzantine_count": byzantine_count,
+                "byzantine_lo_delay_ms": matrix["byzantine_lo_delay_ms"],
                 "gamma": matrix["gamma"],
                 "rate": rate,
                 "tx_size": matrix["tx_size"],
@@ -708,7 +739,7 @@ def kill(ctx):
 def logs(ctx):
     """Reparse local logs, grouping remote replicas without rerunning AWS."""
     for path in sorted(LOG_DIR.glob("*.log")):
-        remote = re.fullmatch(r"(remote-n(\d+)-r\d+-run\d+)-node(\d+)\.log", path.name)
+        remote = re.fullmatch(r"(remote-n(\d+)-r\d+(?:-f\d+-b\d+-d\d+)?-run\d+)-node(\d+)\.log", path.name)
         if remote and remote.group(3) != "0":
             continue
         try:

@@ -40,8 +40,62 @@ fab stop
 `fab create --nodes=1` creates one instance in each configured region. The
 `nodes` matrix in `fabfile.py` is the AUTIG replica count, so enough running
 instances must exist for the largest configured value. All `n` replicas are
-started; `faults` marks the last `f` replicas as the benchmark's malicious
-LocalOrder producers and does not mean that those instances are omitted.
+started; `faults` is the protocol fault bound F. By default the last F replicas
+are malicious LocalOrder producers; `byzantine_count` can independently select
+the last b replicas, with 0 <= b <= F. These instances are not omitted.
+
+### Actual Byzantine-node sensitivity
+
+Keep `nodes`, `faults` (F), `gamma`, workload and LO settings fixed, and sweep
+`byzantine_count` (b). In the `remote` matrix, for example, set:
+
+```python
+"nodes": [10],
+"faults": 2,
+"gamma": 1.0,
+"byzantine_count": [0, 1, 2],
+"byzantine_lo_delay_ms": 200,
+```
+
+Then run `fab remote` with the usual AWS settings. The 200ms delay is an example
+attack strength, not a required setting. Use the same value at every b. For
+the local task, `byzantine_count` is a single integer or `None`, not a list.
+Defaults remain `[None]` remotely / `None` locally (b=F), with zero delay.
+Update both the controller script and the deployed Go binary.
+
+The equivalent node flags are `-f 2 -gamma 1 -byzantine-count 1
+-byzantine-lo-delay 200ms`. Omitting `-byzantine-count` uses F. An explicit zero
+selects no malicious nodes. The existing reversal of fresh LO transaction order
+is retained. Positive delay adds a cancellable wait **before every malicious
+LO generation/send attempt**, including retransmissions. It does not hold an
+already-signed LO, block message reception/verification/commit, or accumulate
+delayed background sends. The regular LO ticker remains in use; missed ticks
+can coalesce. Finish and measurement cancellation interrupt the wait.
+
+No protocol thresholds, evidence selection or simulated-commit conditions are
+changed. With gamma=1 the existing overlap constraint requires n >= 4F+1:
+n=10 allows F<=2, not F=3 (F=3 requires at least n=13). Arbitrary gamma must
+also satisfy `2*ceil(gamma*(n-F)) >= n+2F+1`.
+
+Log/result filenames include F, b and delay; JSON records the resolved b even
+when its input is `None`. Node logs include `BENCHMARK FAULTS`, and per-node
+mechanism counts include `byzantine_lo_delay_attempts` and
+`byzantine_lo_delay_completed` when delays occur. Raw-log recovery supports
+both old and new remote filenames.
+
+This is a reverse-order / delayed-LO experiment with a fixed order leader and
+the existing simulated hosting commit. A scheduled silent replica can still
+stall the collector; no handoff is implemented. More delayed replicas need
+not yield strictly monotonic TPS degradation, particularly when one delayed
+replica already limits most rounds. Compare identical offered-rate sweeps,
+completion ratios and completed-transaction latency alongside TPS.
+
+For a local functional smoke test, run `python benchmark/smoke_faults.py` from
+the repository root with the controller dependencies installed and Go on PATH.
+It starts ten separate TCP node processes per case, checks b=0/1/2 with and
+without delay, legacy CLI defaults, final-state agreement and cancellation of
+a long delay. It stores logs/results in a printed system temporary directory.
+These short local runs are correctness checks, not AWS performance estimates.
 
 Logs are stored in `benchmark/logs` and parsed JSON results in
 `benchmark/results`. `fab destroy` permanently terminates all AWS instances
