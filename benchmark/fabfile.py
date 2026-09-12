@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from json import dump, dumps, load, loads
 from math import ceil
 from pathlib import Path
+import hashlib
 import os
 import re
 import shlex
@@ -25,6 +26,16 @@ LOG_DIR = BENCHMARK_DIR / "logs"
 RESULT_DIR = BENCHMARK_DIR / "results"
 GENESIS = "0" * 64
 GO_VERSION = "1.22.12"
+
+
+def _controller_identity():
+    path = Path(__file__).resolve()
+    return {"controller_script": str(path), "controller_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
+def _print_metrics(metrics):
+    hidden = {"replica_states", "replica_builds", "replica_instances", "ip_mode", "mechanism_nodes"}
+    print(dumps({key: value for key, value in metrics.items() if key not in hidden}, indent=2))
 
 
 def _settings():
@@ -264,6 +275,43 @@ def _parse_log(path):
     return metrics
 
 
+def _parse_run_logs(paths):
+    missing = [str(path) for path in paths if not path.is_file()]
+    if missing:
+        raise RuntimeError("missing node logs: " + ", ".join(missing))
+    metrics = _parse_log(paths[0])
+    metrics.update(replica_states={}, replica_builds={}, mechanism_nodes={}, cpu_processes=[])
+    failure_markers = {
+        "locally_failed_local_order_send_attempts": "BENCHMARK LOCAL SEND FAILURE: LocalOrder",
+        "locally_failed_autig_candidate_send_attempts": "BENCHMARK LOCAL SEND FAILURE: AUTIGCandidate",
+        "locally_failed_benchmark_commit_send_attempts": "BENCHMARK LOCAL SEND FAILURE: BenchmarkAUTIGCommit",
+    }
+    for key in failure_markers:
+        metrics[key] = 0
+    for replica_id, path in enumerate(paths):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if any(marker in text for marker in ("Verification FAILED", "BENCHMARK INVALID", "Order leader rejected", "panic:")):
+            raise RuntimeError(f"{path} reports a failed benchmark")
+        metrics["replica_builds"][str(replica_id)] = _parse_build(text)
+        mechanism = _parse_mechanism(text)
+        if set(metrics["mechanism_nodes"]) & set(mechanism["mechanism_nodes"]):
+            raise RuntimeError("duplicate replica mechanism reports across logs")
+        metrics["mechanism_nodes"].update(mechanism["mechanism_nodes"])
+        metrics["cpu_processes"].extend(mechanism["cpu_processes"])
+        metrics["replica_states"].update({
+            replica: (seq, state, digest)
+            for replica, seq, state, digest in re.findall(
+                r"BENCHMARK STATE replica=(\d+) seq=(\d+) state=([0-9a-f]{64}) fragment=([0-9a-f]{64})", text
+            )
+        })
+        for key, marker in failure_markers.items():
+            metrics[key] += text.count(marker)
+    states = metrics["replica_states"]
+    if set(states) != {str(i) for i in range(len(paths))} or len(set(states.values())) != 1:
+        raise RuntimeError("replicas did not report the same final committed sequence, state and fragment")
+    return metrics
+
+
 def _write_result(mode, parameters, run, metrics):
     states = metrics["replica_states"]
     if set(states) != {str(i) for i in range(parameters["nodes"])} or len(set(states.values())) != 1:
@@ -287,6 +335,12 @@ def _write_result(mode, parameters, run, metrics):
     metrics["offered_rate_tolerance"] = tolerance
     metrics["offered_rate_within_tolerance"] = rate_within_tolerance
     mechanism = _mechanism_summary(metrics, parameters["nodes"])
+    if mechanism is None and "mechanism_nodes" in metrics:
+        raise RuntimeError(
+            "No BENCHMARK MECHANISM records were found. Update the controller fabfile.py "
+            "and rebuild/deploy the node binary; stage_timing/cpuprofile are not required. "
+            "Raw logs have been retained."
+        )
     if mechanism is not None:
         metrics["mechanism"] = mechanism
     if metrics["locally_failed_transaction_send_attempts"] != 0:
@@ -306,6 +360,7 @@ def _write_result(mode, parameters, run, metrics):
     result = {
         "mode": mode,
         "timestamp": timestamp.isoformat(),
+        **_controller_identity(),
         "run": run,
         **parameters,
         **metrics,
@@ -326,8 +381,7 @@ def _write_result(mode, parameters, run, metrics):
             file=sys.stderr,
         )
     # Keep reproducibility and state-validation data in JSON, without flooding the console.
-    hidden = {"replica_states", "replica_builds", "replica_instances", "ip_mode", "mechanism_nodes"}
-    print(dumps({key: value for key, value in result.items() if key not in hidden}, indent=2))
+    _print_metrics(result)
     print(f"Result saved: {RESULT_DIR / filename}")
 
 
@@ -527,47 +581,18 @@ def _run_remote_once(records, settings, parameters, run):
 
         _parallel(records, cleanup)
         raise RuntimeError("remote AUTIG did not exit before the benchmark timeout; logs were downloaded")
-    leader_log = LOG_DIR / (
-        f"remote-n{parameters['nodes']}-r{parameters['rate']}-run{run}-node0.log"
-    )
-    metrics = _parse_log(leader_log)
+    paths = [LOG_DIR / f"remote-n{parameters['nodes']}-r{parameters['rate']}-run{run}-node{i}.log"
+             for i in range(parameters["nodes"])]
+    metrics = _parse_run_logs(paths)
     metrics["ip_mode"] = "public"  # Actual transport configuration below.
-    metrics["replica_builds"] = {}
-    metrics["mechanism_nodes"] = {}
-    metrics["cpu_processes"] = []
     metrics["replica_instances"] = {str(i): record for i, record in enumerate(records)}
-    metrics["locally_failed_local_order_send_attempts"] = 0
-    metrics["locally_failed_autig_candidate_send_attempts"] = 0
-    metrics["locally_failed_benchmark_commit_send_attempts"] = 0
-    for replica_id in range(parameters["nodes"]):
-        path = LOG_DIR / (
-            f"remote-n{parameters['nodes']}-r{parameters['rate']}"
-            f"-run{run}-node{replica_id}.log"
-        )
-        text = path.read_text(encoding="utf-8", errors="replace")
-        metrics["replica_builds"][str(replica_id)] = _parse_build(text)
-        mechanism = _parse_mechanism(text)
-        if set(metrics["mechanism_nodes"]) & set(mechanism["mechanism_nodes"]):
-            raise RuntimeError("duplicate replica mechanism reports across logs")
-        metrics["mechanism_nodes"].update(mechanism["mechanism_nodes"])
-        metrics["cpu_processes"].extend(mechanism["cpu_processes"])
-        if any(marker in text for marker in ("Verification FAILED", "BENCHMARK INVALID", "Order leader rejected", "panic:")):
-            raise RuntimeError(f"{path} reports a failed benchmark")
-        metrics["replica_states"].update({
-            replica: (seq, state, digest)
-            for replica, seq, state, digest in re.findall(
-                r"BENCHMARK STATE replica=(\d+) seq=(\d+) state=([0-9a-f]{64}) fragment=([0-9a-f]{64})", text
-            )
-        })
-        metrics["locally_failed_local_order_send_attempts"] += text.count("BENCHMARK LOCAL SEND FAILURE: LocalOrder")
-        metrics["locally_failed_autig_candidate_send_attempts"] += text.count("BENCHMARK LOCAL SEND FAILURE: AUTIGCandidate")
-        metrics["locally_failed_benchmark_commit_send_attempts"] += text.count("BENCHMARK LOCAL SEND FAILURE: BenchmarkAUTIGCommit")
     _write_result("remote", parameters, run, metrics)
 
 
 @task
 def local(ctx):
     """Build and run one local AUTIG benchmark."""
+    print("BENCHMARK CONTROLLER " + dumps(_controller_identity()))
     parameters = {
         "nodes": 5,
         "faults": 1,
@@ -605,6 +630,7 @@ def local(ctx):
 @task
 def remote(ctx):
     """Run the benchmark matrix on existing AWS instances."""
+    print("BENCHMARK CONTROLLER " + dumps(_controller_identity()))
     matrix = {
         "faults": 1,
         "nodes": [5],
@@ -680,11 +706,26 @@ def kill(ctx):
 
 @task
 def logs(ctx):
-    """Parse all locally available AUTIG logs."""
+    """Reparse local logs, grouping remote replicas without rerunning AWS."""
     for path in sorted(LOG_DIR.glob("*.log")):
+        remote = re.fullmatch(r"(remote-n(\d+)-r\d+-run\d+)-node(\d+)\.log", path.name)
+        if remote and remote.group(3) != "0":
+            continue
         try:
             print(path.name)
-            print(dumps(_parse_log(path), indent=2))
+            if remote:
+                nodes = int(remote.group(2))
+                paths = [path.with_name(f"{remote.group(1)}-node{i}.log") for i in range(nodes)]
+                metrics = _parse_run_logs(paths)
+            else:
+                metrics = _parse_log(path)
+                nodes = len(metrics["replica_states"])
+            summary = _mechanism_summary(metrics, nodes)
+            if summary is not None:
+                metrics["mechanism"] = summary
+            else:
+                print("  WARNING: no mechanism records in these logs; resource costs cannot be recovered.")
+            _print_metrics(metrics)
         except RuntimeError as error:
             print(f"  skipped: {error}")
 

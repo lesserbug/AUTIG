@@ -91,6 +91,11 @@ class OfferedRateResultTests(unittest.TestCase):
         self.assertIn("replica_states", result)
         self.assertEqual(result["replica_instances"]["0"]["public_ip"], "192.0.2.1")
 
+    def test_live_result_rejects_missing_mechanism_records(self):
+        self.metrics.update(mechanism_nodes={}, cpu_processes=[])
+        with self.assertRaisesRegex(RuntimeError, "rebuild/deploy"):
+            self.write_result()
+
 
 class DiagnosticMetadataTests(unittest.TestCase):
     def test_build_identity_is_from_binary_log_and_unknown_is_explicit(self):
@@ -159,6 +164,35 @@ class MechanismTests(unittest.TestCase):
         self.assertEqual(parsed["cpu_processes"], records["cpu_processes"])
         with self.assertRaisesRegex(RuntimeError, "duplicate"):
             fabfile._parse_mechanism(text + "\n" + text)
+
+    def test_logs_recovers_all_replicas_and_hides_state(self):
+        records = self.records()
+        with tempfile.TemporaryDirectory() as directory:
+            paths = [Path(directory) / f"remote-n2-r100-run1-node{i}.log" for i in range(2)]
+            for i, path in enumerate(paths):
+                path.write_text(
+                    f"BENCHMARK STATE replica={i} seq=5 state={'a' * 64} fragment={'b' * 64}\n"
+                    + "BENCHMARK MECHANISM " + json.dumps(records["mechanism_nodes"][str(i)]) + "\n"
+                    + "BENCHMARK CPU " + json.dumps({"replicas": [i], "cpu_seconds": 1, "sample_seconds": 10}),
+                    encoding="utf-8",
+                )
+            # Base throughput parsing has separate coverage; use real per-node log merging here.
+            with patch.object(fabfile, "_parse_log", side_effect=lambda path: {"finalized": 100}):
+                metrics = fabfile._parse_run_logs(paths)
+                self.assertEqual(fabfile._mechanism_summary(metrics, 2)["lo_fresh"], 10)
+                output = io.StringIO()
+                with patch.object(fabfile, "LOG_DIR", Path(directory)), contextlib.redirect_stdout(output):
+                    fabfile.logs.body(None)
+                self.assertIn('"lo_fresh": 10', output.getvalue())
+                self.assertEqual(output.getvalue().count('"mechanism":'), 1)
+                self.assertNotIn('"replica_states"', output.getvalue())
+                self.assertNotIn('"mechanism_nodes"', output.getvalue())
+                with self.assertRaisesRegex(RuntimeError, "missing node logs"):
+                    fabfile._parse_run_logs(paths + [Path(directory) / "missing.log"])
+                with paths[1].open("a", encoding="utf-8") as handle:
+                    handle.write("\nBENCHMARK INVALID: bad commit\n")
+                with self.assertRaisesRegex(RuntimeError, "failed benchmark"):
+                    fabfile._parse_run_logs(paths)
 
 
 if __name__ == "__main__":

@@ -54,6 +54,22 @@ The terminal hides per-replica state hashes, build lists and instance/IP
 metadata; the full result JSON and raw logs retain them for reproducibility
 and the existing final-state consistency check.
 
+`fab remote` updates/builds the **EC2** checkout, not the controller checkout
+where you invoked Fabric. Update the controller's `benchmark/fabfile.py` too,
+preserving your experiment matrix. New local/remote runs print
+`BENCHMARK CONTROLLER` with the resolved script path and SHA-256, also saved
+in result JSON. Missing mechanism records now reject new results explicitly.
+If a result has neither `mechanism_nodes` nor `cpu_processes`, it was not
+produced by the current parser, regardless of the node's `git_commit` value.
+
+To recover already-downloaded measurements, enter the updated controller's
+`benchmark` directory and run `fab -f fabfile.py logs`. This groups all remote
+node logs by run, checks final-state agreement and prints the aggregated
+`mechanism` with node details hidden. It does not contact AWS or rerun the
+experiment. Old logs lacking mechanism records print a warning; their resource
+costs cannot be reconstructed from throughput/latency alone. Recovery prints
+the summary and does not overwrite existing result JSON files.
+
 The result's `mechanism` object reports fresh LO count/rate, retransmission
 attempt count/rate, actual LO signatures (including re-signing), mean fresh LO
 ID count (including empty orders), receipt-queue peak and cutoff lengths,
